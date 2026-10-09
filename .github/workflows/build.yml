@@ -1,0 +1,50 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Test
+        run: swift test
+
+      - name: Build
+        run: scripts/build.sh --zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Caffeinator
+          path: build/Caffeinator.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sum=$(shasum -a 256 build/Caffeinator.zip | cut -d ' ' -f 1)
+          cat > notes.md <<EOF
+          Download **Caffeinator.zip**, unzip it, and move Caffeinator to Applications.
+
+          The app is ad-hoc signed, not notarized, so macOS blocks the first launch. Open it once, then go to System Settings › Privacy & Security and click **Open Anyway**. Or run:
+
+          \`\`\`
+          xattr -dr com.apple.quarantine /Applications/Caffeinator.app
+          \`\`\`
+
+          macOS 14 or later, Apple silicon and Intel.
+
+          SHA-256: \`$sum\`
+          EOF
+          gh release create "$GITHUB_REF_NAME" build/Caffeinator.zip --title "Caffeinator ${GITHUB_REF_NAME#v}" --notes-file notes.md
