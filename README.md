@@ -90,12 +90,23 @@ Scheduled actions keep the Mac from idling to sleep until they run. If the Mac s
 ## Build
 
 ```sh
-swift test
 scripts/build.sh            # build/Caffeinator.app, universal, ad-hoc signed
 scripts/build.sh --install  # also copies it to /Applications and relaunches
+swift test --scratch-path /tmp/caffeinator-build
 ```
 
-Requires Xcode 16 or later. Pushing a `v*` tag runs the GitHub Actions workflow, which tests, builds and publishes a release with the zip.
+Requires Xcode 16 or later. The scripts compile outside the repo, so a checkout in iCloud Drive works.
+
+## Release
+
+Releases are built and published from a Mac, with no CI:
+
+```sh
+scripts/release.sh 1.0.1 --dry-run  # tests and builds, then shows the release notes
+scripts/release.sh 1.0.1            # also tags, pushes and publishes the GitHub release
+```
+
+It needs a clean `main` and the [GitHub CLI](https://cli.github.com) signed in. The release gets the zip, install steps, its SHA-256 and GitHub's generated changelog.
 
 ## License
 

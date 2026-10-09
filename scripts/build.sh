@@ -10,12 +10,13 @@ version="${VERSION:-$(git describe --tags --abbrev=0 2>/dev/null || echo 1.0.0)}
 version="${version#v}"
 number="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
 
-flags=(-c release --arch arm64 --arch x86_64 ${SCRATCH:+--scratch-path "$SCRATCH"})
+# Compile outside the repo. Synced folders like iCloud Documents add Finder metadata
+# that codesign refuses, and would upload the build cache.
+flags=(-c release --arch arm64 --arch x86_64 --scratch-path "${SCRATCH:-${TMPDIR:-/tmp}/caffeinator-build}")
 swift build "${flags[@]}"
 bin="$(swift build "${flags[@]}" --show-bin-path)"
 
-# Assemble and sign in a temp folder. Synced folders like iCloud Documents add
-# Finder metadata that codesign refuses.
+# Assemble and sign in a temp folder for the same reason.
 stage="$(mktemp -d)/Caffeinator.app"
 mkdir -p "$stage/Contents/MacOS" "$stage/Contents/Resources"
 # SwiftPM records the deployment target as the SDK version. Stamp the real one so
