@@ -29,7 +29,11 @@ enum Key {
     static let savedSession = "savedSession"
     static let resumeNext = "resumeNext"
     static let restoreVolume = "restoreVolume"
+    static let sessions = "sessions"
+    static let thanked = "thanked"
 }
+
+let donateURL = URL(string: "https://paypal.me/theblindiephoenix")!
 
 enum Prefs {
     static var d: UserDefaults { .standard }

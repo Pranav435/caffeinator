@@ -43,6 +43,7 @@ for arg in "$@"; do
         ;;
     --install)
         pkill -x Caffeinator || true
+        while pgrep -x Caffeinator >/dev/null; do sleep 0.2; done
         rm -rf /Applications/Caffeinator.app
         ditto "$stage" /Applications/Caffeinator.app
         open /Applications/Caffeinator.app

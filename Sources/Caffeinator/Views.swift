@@ -27,6 +27,8 @@ import SwiftUI
 
     static func showSettings() { show("settings", title: "Caffeinator Settings", reuse: true) { SettingsView() } }
 
+    static func showThanks() { show("thanks", title: "Caffeinator") { ThanksView() } }
+
     static func showTimeEntry(_ mode: TimeEntryView.Mode, _ engine: Engine) {
         show("time", title: mode == .keepAwake ? "Keep Awake" : "Schedule") { TimeEntryView(mode: mode, engine: engine) }
     }
@@ -78,6 +80,9 @@ private struct GeneralTab: View {
                     try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
                     login = SMAppService.mainApp.status == .enabled
                 }
+            Section {
+                Link(destination: donateURL) { Label("Buy the developer a coffee", systemImage: "cup.and.saucer") }
+            }
         }
     }
 }
@@ -362,6 +367,31 @@ struct TimeEntryView: View {
             engine.scheduler.schedule(action, at: end)
         }
         Windows.close("time")
+    }
+}
+
+// MARK: Thank-you
+
+private struct ThanksView: View {
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 64, height: 64).accessibilityHidden(true)
+            Text("20 naps prevented").font(.title2.bold())
+            Text("Caffeinator is free, with no ads. Its developer runs on coffee, if you'd like to send one over.")
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            // No Return shortcut: this can appear while you type, and a stray Return shouldn't open PayPal.
+            HStack {
+                Button("Not Now") { Windows.close("thanks") }.keyboardShortcut(.cancelAction)
+                Button("Buy a Coffee") {
+                    NSWorkspace.shared.open(donateURL)
+                    Windows.close("thanks")
+                }
+            }
+        }
+        .padding(24)
+        .frame(width: 320)
     }
 }
 

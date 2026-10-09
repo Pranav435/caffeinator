@@ -8,6 +8,14 @@ Free, no ads, no tracking. If it rescues a render, [buy its developer a coffee](
 
 ## Install
 
+With [Homebrew](https://brew.sh), which also skips the "Open Anyway" step below:
+
+```sh
+brew install --cask pranav435/tap/caffeinator
+```
+
+Or by hand:
+
 1. Download `Caffeinator.zip` from [Releases](https://github.com/Pranav435/caffeinator/releases/latest).
 2. Unzip it and move Caffeinator to Applications.
 3. Open it. macOS blocks the first launch because the app isn't notarized. Notarizing costs $99 a year; this app costs nothing. ([Donate](#donate) has a plan for that.) Go to System Settings › Privacy & Security and click **Open Anyway**, or run:
@@ -21,6 +29,11 @@ Requires macOS 14 or later. Runs natively on Apple silicon and Intel.
 ## Use
 
 Click the cup to open the menu. A filled cup means the Mac is staying awake. An empty one means it's allowed to nap.
+
+<p>
+<img src="docs/menu.png" width="222" alt="The Caffeinator menu, reading On, 2 hours left, with Turn Off, Keep Awake, When It Ends, Add 15 Minutes, Power, Settings and Quit.">
+<img src="docs/settings.png" width="420" alt="Caffeinator Settings on the General tab: the Option-Command-Z shortcut, how long to stay on, keep display on, time left in the menu bar, sounds, VoiceOver announcements, resume after restart, launch at login, and a link to buy the developer a coffee.">
+</p>
 
 | Menu item | What it does |
 |---|---|
@@ -85,6 +98,8 @@ Caffeinator has no ads, no account, no subscription, no "Pro" tier and no analyt
 
 Your Mac stays up on Caffeinator. Caffeinator stays up on its developer. Its developer stays up on coffee. You can see where this is going.
 
+Notarization fund: **$0 of $99**.
+
 | Order | What it does |
 |---|---|
 | [Espresso, $3](https://paypal.me/theblindiephoenix/3USD) | Covers one cup and one bug fix, in that order |
@@ -94,6 +109,13 @@ Your Mac stays up on Caffeinator. Caffeinator stays up on its developer. Its dev
 | [Your own amount](https://paypal.me/theblindiephoenix) | All currencies are converted to coffee at a fair rate |
 
 If Caffeinator has saved one download, render or presentation from a surprise nap, that's about one coffee's worth. Can't spare the money? A star on the repo costs nothing, and yes, someone checks.
+
+### Fueled by
+
+Add a note to your PayPal payment if you'd like your name here.
+
+<!-- donors: scripts/donation.sh adds names below this line -->
+Empty, like a mug on Monday morning.
 
 ## How it works
 
@@ -111,6 +133,7 @@ Scheduled actions keep the Mac from idling to sleep until they run. If the Mac s
 scripts/build.sh            # build/Caffeinator.app, universal, ad-hoc signed
 scripts/build.sh --install  # also copies it to /Applications and relaunches
 swift test --scratch-path /tmp/caffeinator-build
+swift scripts/make-art.swift  # redraws the icon, docs/icon.png and the social preview card
 ```
 
 Requires Xcode 16 or later. The scripts compile outside the repo, so a checkout in iCloud Drive works.
@@ -124,7 +147,9 @@ scripts/release.sh 1.0.1 --dry-run  # tests and builds, then shows the release n
 scripts/release.sh 1.0.1            # also tags, pushes and publishes the GitHub release
 ```
 
-It needs a clean `main` and the [GitHub CLI](https://cli.github.com) signed in. The release gets the zip, install steps, its SHA-256 and GitHub's generated changelog.
+It needs a clean `main` and the [GitHub CLI](https://cli.github.com) signed in. The release gets the zip, install steps, its SHA-256 and GitHub's generated changelog, and the [Homebrew cask](https://github.com/Pranav435/homebrew-tap) moves to the new version.
+
+When a donation comes in, `scripts/donation.sh 5 "Ada L."` adds it to the fund in this README, lists the name (leave it out for anonymous donors), commits and pushes.
 
 ## License
 

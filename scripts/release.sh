@@ -1,7 +1,8 @@
 #!/bin/bash
-# Publishes a GitHub release from this Mac: tests, builds the universal zip, tags, pushes and uploads.
+# Publishes a GitHub release from this Mac: tests, builds the universal zip, tags, pushes, uploads,
+# and points the Homebrew cask at the new zip.
 #   scripts/release.sh 1.0.1            release v1.0.1
-#   scripts/release.sh 1.0.1 --dry-run  everything except the tag, push and upload
+#   scripts/release.sh 1.0.1 --dry-run  everything except the tag, push, upload and cask update
 # Needs the GitHub CLI, signed in (gh auth login).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -43,3 +44,10 @@ git tag -a "v$version" -m "Caffeinator $version"
 git push origin main "v$version"
 # --notes goes above GitHub's generated changelog.
 gh release create "v$version" build/Caffeinator.zip --verify-tag --title "Caffeinator $version" --notes "$notes" --generate-notes
+
+tap="$(mktemp -d)"
+gh repo clone "${TAP_REPO:-Pranav435/homebrew-tap}" "$tap" -- -q
+perl -pi -e "s/^  version \".*\"/  version \"$version\"/; s/^  sha256 \".*\"/  sha256 \"$sum\"/" "$tap/Casks/caffeinator.rb"
+git -C "$tap" commit -qam "Caffeinator $version"
+git -C "$tap" push -q
+echo "Released v$version and updated the Homebrew cask."

@@ -80,6 +80,20 @@ enum Until: Equatable {
         case nil: end.map { " for \(Fmt.spoken($0.timeIntervalSinceNow))" } ?? ""
         }
         changed(quiet ? nil : "Caffeinator on" + detail, sound: !quiet)
+        if !quiet { countSession() }
+    }
+
+    /// Shows a one-time thank-you on the 20th session. It never appears again, whatever the answer.
+    private func countSession() {
+        let count = Prefs.d.integer(forKey: Key.sessions) + 1
+        Prefs.d.set(count, forKey: Key.sessions)
+        guard count >= 20, !Prefs.d.bool(forKey: Key.thanked) else { return }
+        Prefs.d.set(true, forKey: Key.thanked)
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            Windows.showThanks()
+            announce("Caffeinator left you a thank-you note")
+        }
     }
 
     func stop() {
