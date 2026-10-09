@@ -30,6 +30,8 @@ xattr -dr com.apple.quarantine /Applications/Caffeinator.app
 
 macOS 14 or later, Apple silicon and Intel.
 
+Free, no ads, no tracking. If it rescues a render, [buy its developer a coffee](https://paypal.me/theblindiephoenix).
+
 SHA-256: \`$sum\`"
 
 if [[ "${2:-}" == "--dry-run" ]]; then

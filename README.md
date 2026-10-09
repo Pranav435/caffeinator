@@ -1,14 +1,16 @@
 # Caffeinator
 
-Keep your Mac awake from the menu bar. Press ⌥⌘Z, or click the cup. It will stay up later than you do.
+Your Mac is a gifted napper. Leave it alone for a few minutes and it dozes off mid-download, mid-render or mid-presentation. Caffeinator is the coffee: press ⌥⌘Z, or click the cup in the menu bar, and the Mac will stay up later than you do.
 
-Caffeinator can also sleep, lock, log out, restart or shut down the Mac on a timer, and it can stay awake by itself while conditions you choose are true. It works fully with VoiceOver. It's a native Swift app with no dependencies, and the download is under 1 MB.
+Caffeinator can also put the Mac to bed on your schedule (sleep, lock, log out, restart or shut down), and it can keep the Mac up by itself during calls or while the apps you pick are running. Everything works with VoiceOver. The app is native Swift with no dependencies, and the download is under 1 MB.
+
+Free, no ads, no tracking. If it rescues a render, [buy its developer a coffee](#donate).
 
 ## Install
 
 1. Download `Caffeinator.zip` from [Releases](https://github.com/Pranav435/caffeinator/releases/latest).
 2. Unzip it and move Caffeinator to Applications.
-3. Open it. macOS blocks the first launch because the app isn't notarized. Notarizing costs $99 a year; this app costs nothing. Go to System Settings › Privacy & Security and click **Open Anyway**, or run:
+3. Open it. macOS blocks the first launch because the app isn't notarized. Notarizing costs $99 a year; this app costs nothing. ([Donate](#donate) has a plan for that.) Go to System Settings › Privacy & Security and click **Open Anyway**, or run:
 
    ```sh
    xattr -dr com.apple.quarantine /Applications/Caffeinator.app
@@ -36,11 +38,11 @@ Custom times take a length (`90m`, `2h`, `1h30`) or a clock time (`5pm`, `17:30`
 
 **General:** the shortcut, how long the shortcut and Turn On keep the Mac awake, whether the display stays on, time left in the menu bar, sounds, VoiceOver announcements, resume after restart, launch at login.
 
-**Triggers:** stay awake while the camera or mic is in use, while plugged in, while an external display is connected, while someone is connected over SSH or Screen Sharing, or while apps you pick are running. Turn off when the battery drops below a set level, because a dead battery wins every argument. After you've been away for a set time, let the Mac sleep, lock the screen, or turn off the display.
+**Triggers:** stay awake while the camera or mic is in use, while plugged in, while an external display is connected, while someone is connected over SSH or Screen Sharing, or while apps you pick are running. It won't doze off during your video call, which is more than can be said for some of the attendees. Turn off when the battery drops below a set level, because a dead battery wins every argument. After you've been away for a set time, let the Mac sleep, lock the screen, or turn off the display. When you leave, it takes the hint.
 
-**Power:** a warning of 30 seconds to 5 minutes before sleep, log out, restart and shut down, with an optional audio fade-out. A nightly routine runs one action at a set time and can wait until you've been idle for 10 minutes, so it won't pull the plug mid-sentence at 1 AM.
+**Power:** a warning of 30 seconds to 5 minutes before sleep, log out, restart and shut down, with an optional audio fade-out for anyone who falls asleep to podcasts. A nightly routine gives the Mac a bedtime: one action at a set time. It can wait until you've been idle for 10 minutes, so it won't pull the plug mid-sentence at 1 AM.
 
-**Automation:** run a shortcut from the Shortcuts app when Caffeinator turns on or off.
+**Automation:** run a shortcut from the Shortcuts app when Caffeinator turns on or off. Set a Focus, start a playlist, dim the lights: whatever your ritual is.
 
 Turning Caffeinator off while a trigger is active pauses that trigger until its condition clears.
 
@@ -68,7 +70,7 @@ Use these from Terminal, Shortcuts, Raycast or scripts. Quote the URL in a shell
 ./render.sh & open "caffeinator://on?pid=$!&then=shutdown"
 ```
 
-Log out, restart and shut down requested by URL always show at least a 30-second warning, so a link on a web page can't power off the Mac without notice.
+Log out, restart and shut down requested by URL always show at least a 30-second warning. A web page can order a coffee, but it can't order a shutdown without notice.
 
 ## VoiceOver
 
@@ -76,6 +78,22 @@ Log out, restart and shut down requested by URL always show at least a 30-second
 - Turning on or off, timer endings, battery and away guards, and warnings are announced without moving focus.
 - The shortcut recorder refuses Control-Option combinations, since VoiceOver got there first.
 - Cancel is the default button in warnings, so Return or Escape stops a shutdown.
+
+## Donate
+
+Caffeinator has no ads, no account, no subscription, no "Pro" tier and no analytics, and it never touches the network. This section is the only part of the project that wants anything from you.
+
+Your Mac stays up on Caffeinator. Caffeinator stays up on its developer. Its developer stays up on coffee. You can see where this is going.
+
+| Order | What it does |
+|---|---|
+| [Espresso, $3](https://paypal.me/theblindiephoenix/3USD) | Covers one cup and one bug fix, in that order |
+| [Flat white, $5](https://paypal.me/theblindiephoenix/5USD) | Costs the same as a café coffee, which lasts an afternoon. Caffeinator lasts as long as your Mac does |
+| [Bag of beans, $20](https://paypal.me/theblindiephoenix/20USD) | Fuels a whole feature, from the first idea to the 2 AM bug it ships with |
+| [A year of notarization, $99](https://paypal.me/theblindiephoenix/99USD) | Goes toward Apple's developer fee, so the app can be notarized and "Open Anyway" disappears for everyone |
+| [Your own amount](https://paypal.me/theblindiephoenix) | All currencies are converted to coffee at a fair rate |
+
+If Caffeinator has saved one download, render or presentation from a surprise nap, that's about one coffee's worth. Can't spare the money? A star on the repo costs nothing, and yes, someone checks.
 
 ## How it works
 
