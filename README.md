@@ -8,21 +8,19 @@ Free, no ads, no tracking. If it rescues a render, [buy its developer a coffee](
 
 ## Install
 
-With [Homebrew](https://brew.sh), which also skips the "Open Anyway" step below:
+With [Homebrew](https://brew.sh), and `brew upgrade` keeps it current:
 
 ```sh
 brew install --cask pranav435/tap/caffeinator
 ```
 
-Or by hand:
+Or by hand: download `Caffeinator.zip` from [Releases](https://github.com/Pranav435/caffeinator/releases/latest), unzip it, and move Caffeinator to Applications.
 
-1. Download `Caffeinator.zip` from [Releases](https://github.com/Pranav435/caffeinator/releases/latest).
-2. Unzip it and move Caffeinator to Applications.
-3. Open it. macOS blocks the first launch because the app isn't notarized. Notarizing costs $99 a year; this app costs nothing. ([Donate](#donate) has a plan for that.) Go to System Settings › Privacy & Security and click **Open Anyway**, or run:
+Either way, the first launch takes one extra step because the app isn't notarized. Notarizing costs $99 a year; this app costs nothing. ([Donate](#donate) has a plan for that.) Open Caffeinator once, then go to System Settings › Privacy & Security and click **Open Anyway**, or run:
 
-   ```sh
-   xattr -dr com.apple.quarantine /Applications/Caffeinator.app
-   ```
+```sh
+xattr -dr com.apple.quarantine /Applications/Caffeinator.app
+```
 
 Requires macOS 14 or later. Runs natively on Apple silicon and Intel.
 
