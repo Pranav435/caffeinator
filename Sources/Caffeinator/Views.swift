@@ -48,6 +48,7 @@ struct SettingsView: View {
             GeneralTab().tabItem { Label("General", systemImage: "gearshape") }
             TriggersTab().tabItem { Label("Triggers", systemImage: "bolt") }
             PowerTab().tabItem { Label("Power", systemImage: "power") }
+            ScreensaverTab().tabItem { Label("Screensaver", systemImage: "sparkles") }
             AutomationTab().tabItem { Label("Automation", systemImage: "terminal") }
         }
         .formStyle(.grouped)
@@ -66,7 +67,7 @@ private struct GeneralTab: View {
 
     var body: some View {
         Form {
-            LabeledContent("Shortcut") { ShortcutRecorder() }
+            LabeledContent("Shortcut") { ShortcutRecorder("Shortcut", key: Key.shortcut, default: .default, hotKey: .toggle) }
             Picker("Turn on for", selection: $minutes) {
                 ForEach(presets, id: \.self) { Text(Fmt.preset($0)).tag($0) }
             }
@@ -242,13 +243,101 @@ private struct AutomationTab: View {
     }
 }
 
+private struct ScreensaverTab: View {
+    @AppStorage(Key.saverIdle) private var idle = 10
+    @AppStorage(Key.saverShuffle) private var shuffle = 10
+    @AppStorage(Key.saverClock) private var clock = true
+    @AppStorage(Key.saverCaptions) private var captions = true
+    @AppStorage(Key.saverSound) private var sound = false
+    @AppStorage(Key.saverVolume) private var volume = 0.6
+    @AppStorage(Key.saverLock) private var lock = false
+    @AppStorage(Key.saverSystem) private var system = false
+    @State private var off = Set(Prefs.saverOff)
+    private let location = Location.shared
+
+    var body: some View {
+        Form {
+            Section {
+                LabeledContent("Shortcut") {
+                    ShortcutRecorder("Screensaver shortcut", key: Key.saverShortcut, default: .screensaver, hotKey: .screensaver)
+                }
+                Button("Start Screensaver") { Screensaver.shared.start() }
+                Picker("Start by itself after", selection: $idle) {
+                    Text("Never").tag(0)
+                    ForEach([5, 10, 15, 30, 60], id: \.self) { Text("\($0) idle minutes").tag($0) }
+                }
+                Picker("Change scene every", selection: $shuffle) {
+                    Text("Never").tag(0)
+                    ForEach([5, 10, 20, 30, 60], id: \.self) { Text("\($0) minutes").tag($0) }
+                }
+                Toggle("Show the clock", isOn: $clock)
+                Toggle("Show captions", isOn: $captions)
+                Toggle("Sound", isOn: $sound)
+                if sound { Slider(value: $volume, in: 0...1) { Text("Volume") } }
+                Toggle("Lock the Mac when it ends", isOn: $lock)
+                Toggle("Use the macOS screen saver instead", isOn: $system)
+            } footer: {
+                Text("Escape or the shortcut ends it. It starts by itself only while Caffeinator keeps the Mac awake, and not while a video plays.")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Section("Location") {
+                LabeledContent("Sky scenes show", value: location.precise ? location.place : "\(location.place), from your time zone")
+                if !location.precise { Button("Use My Location") { location.request() } }
+            }
+            ForEach(Family.allCases) { family in
+                let kinds = SceneKind.all.filter { $0.family == family }
+                if !kinds.isEmpty {
+                    Section(family.rawValue) {
+                        ForEach(kinds) { kind in SceneRow(kind: kind, on: binding(kind.id)) }
+                    }
+                }
+            }
+        }
+        .onChange(of: off) { _, ids in Prefs.d.set(Array(ids).sorted(), forKey: Key.saverOff) }
+    }
+
+    private func binding(_ id: String) -> Binding<Bool> {
+        Binding { !off.contains(id) } set: { on in if on { off.remove(id) } else { off.insert(id) } }
+    }
+}
+
+private struct SceneRow: View {
+    let kind: SceneKind
+    @Binding var on: Bool
+
+    var body: some View {
+        HStack(alignment: .top) {
+            Toggle(isOn: $on) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(kind.name)
+                    Text(kind.about).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .toggleStyle(.checkbox)
+            Spacer()
+            Button("Preview") { Screensaver.shared.start(scene: kind.id) }
+                .accessibilityLabel("Preview \(kind.name)")
+        }
+    }
+}
+
 // MARK: Shortcut recorder
 
 private struct ShortcutRecorder: View {
-    @AppStorage(Key.shortcut) private var raw = Shortcut.default.raw
+    /// What VoiceOver calls the button, such as "Shortcut" or "Screensaver shortcut".
+    let name: String
+    let hotKey: HotKey
+    @AppStorage private var raw: String
     @State private var recording = false
     @State private var monitor: Any?
     @State private var message: String?
+
+    init(_ name: String, key: String, default fallback: Shortcut, hotKey: HotKey) {
+        self.name = name
+        self.hotKey = hotKey
+        _raw = AppStorage(wrappedValue: fallback.raw, key)
+    }
 
     private var shortcut: Shortcut? { Shortcut(raw: raw) }
 
@@ -256,16 +345,16 @@ private struct ShortcutRecorder: View {
         VStack(alignment: .trailing, spacing: 4) {
             HStack(spacing: 6) {
                 Button(recording ? "Type shortcut…" : shortcut?.display ?? "Record") { recording ? stop() : start() }
-                    .accessibilityLabel("Shortcut")
+                    .accessibilityLabel(name)
                     .accessibilityValue(recording ? "Recording" : shortcut?.spoken ?? "None")
                     .accessibilityHint(recording ? "Press the new combination. Escape cancels." : "Records a new combination")
                 if shortcut != nil, !recording {
                     Button {
                         raw = ""
-                        announce("Shortcut cleared")
+                        announce("\(name) cleared")
                     } label: { Image(systemName: "xmark.circle.fill") }
                         .buttonStyle(.borderless)
-                        .accessibilityLabel("Clear shortcut")
+                        .accessibilityLabel("Clear \(name.lowercased())")
                 }
             }
             if let message { Text(message).font(.caption).foregroundStyle(.secondary) }
@@ -276,7 +365,7 @@ private struct ShortcutRecorder: View {
     private func start() {
         recording = true
         message = nil
-        HotKey.shared.suspend()
+        HotKey.suspend()
         announce("Press the new shortcut")
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             record(event)
@@ -287,22 +376,22 @@ private struct ShortcutRecorder: View {
     private func record(_ event: NSEvent) {
         let new = Shortcut(event: event)
         if new.keyCode == kVK_Escape, new.mods == 0 { return stop() }
-        if let problem = new.problem {
+        if let problem = new.problem ?? (HotKey.all.contains { $0 !== hotKey && $0.shortcut == new } ? "Caffeinator already uses that combination." : nil) {
             message = problem
             return announce(problem)
         }
         raw = new.raw
-        HotKey.shared.set(new)
+        hotKey.set(new)
         stop()
-        message = HotKey.shared.failed ? "Another app already uses \(new.display)." : nil
-        announce(HotKey.shared.failed ? "Another app already uses \(new.spoken)" : "Shortcut set to \(new.spoken)")
+        message = hotKey.failed ? "Another app already uses \(new.display)." : nil
+        announce(hotKey.failed ? "Another app already uses \(new.spoken)" : "\(name) set to \(new.spoken)")
     }
 
     private func stop() {
         recording = false
         if let monitor { NSEvent.removeMonitor(monitor) }
         monitor = nil
-        HotKey.shared.resume()
+        HotKey.resume()
     }
 }
 
@@ -419,3 +508,4 @@ struct WarningView: View {
         .frame(width: 300)
     }
 }
+

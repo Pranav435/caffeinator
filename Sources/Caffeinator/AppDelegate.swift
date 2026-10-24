@@ -15,8 +15,14 @@ import AppKit
         item.menu = menu
 
         engine.onChange = { [weak self] in self?.refresh() }
-        HotKey.shared.action = { [weak self] in self?.engine.toggle() }
-        HotKey.shared.set(Prefs.shortcut)
+        let saver = Screensaver.shared
+        saver.engine = engine
+        engine.onTick = { saver.idleCheck() }
+        engine.onAway = { saver.stop(byUser: false) }
+        HotKey.toggle.action = { [weak self] in self?.engine.toggle() }
+        HotKey.toggle.set(Prefs.shortcut)
+        HotKey.screensaver.action = { saver.toggle() }
+        HotKey.screensaver.set(Prefs.saverShortcut)
         NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.prefsChanged() }
         }
@@ -29,7 +35,9 @@ import AppKit
     }
 
     private func prefsChanged() {
-        if HotKey.shared.shortcut != Prefs.shortcut { HotKey.shared.set(Prefs.shortcut) }
+        if HotKey.toggle.shortcut != Prefs.shortcut { HotKey.toggle.set(Prefs.shortcut) }
+        if HotKey.screensaver.shortcut != Prefs.saverShortcut { HotKey.screensaver.set(Prefs.saverShortcut) }
+        Screensaver.shared.prefsChanged()
         engine.reconfigure()
         refresh()
     }
@@ -57,6 +65,7 @@ import AppKit
                 + PowerAction.allCases.map { a in MenuItem(a.title, checked: e.then == a) { e.setThen(a) } }))
         if e.end != nil { items.append(MenuItem("Add 15 Minutes") { e.extend(minutes: 15) }) }
         items.append(.separator())
+        items.append(submenu("Screensaver", screensaverItems()))
         items.append(submenu("Power", powerItems()))
         if let p = e.scheduler.pending {
             items.append(MenuItem("Cancel \(p.action.title) at \(Fmt.clock(p.date))") { e.scheduler.cancel() })
@@ -85,6 +94,18 @@ import AppKit
             MenuItem("Until Activity Stops") { e.start(until: .activity) },
             MenuItem("Custom…") { Windows.showTimeEntry(.keepAwake, e) },
         ]
+    }
+
+    private func screensaverItems() -> [NSMenuItem] {
+        let saver = Screensaver.shared
+        var items: [NSMenuItem] = [MenuItem(saver.isShowing ? "Stop" : "Start") { saver.toggle() }]
+        for family in Family.allCases {
+            let kinds = SceneKind.all.filter { $0.family == family }
+            guard !kinds.isEmpty else { continue }
+            items += [.separator(), .sectionHeader(title: family.rawValue)]
+            items += kinds.map { kind in MenuItem(kind.name) { saver.start(scene: kind.id) } }
+        }
+        return items
     }
 
     private func powerItems() -> [NSMenuItem] {
@@ -150,6 +171,8 @@ final class MenuItem: NSMenuItem {
         "open \"caffeinator://on?pid=1234&then=shutdown\"",
         "open \"caffeinator://on?until=activity\"",
         "open \"caffeinator://shutdown?in=2h\"",
+        "open \"caffeinator://screensaver?scene=black-hole\"",
+        "open \"caffeinator://screensaver?off\"",
         "open \"caffeinator://off\"",
     ]
 
@@ -176,6 +199,8 @@ final class MenuItem: NSMenuItem {
                 engine.start(end: time)
             }
         case "off": engine.stop()
+        case "screensaver":
+            if q["off"] != nil { Screensaver.shared.stop() } else { Screensaver.shared.start(scene: q["scene"]) }
         case "toggle": engine.toggle()
         case "cancel": engine.scheduler.cancel()
         case "settings": Windows.showSettings()

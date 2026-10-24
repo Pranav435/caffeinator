@@ -25,12 +25,25 @@ enum Key {
     static let nightlyWaitIdle = "nightlyWaitIdle"
     static let onShortcut = "onShortcut"
     static let offShortcut = "offShortcut"
+    static let saverShortcut = "saverShortcut"
+    static let saverIdle = "saverIdle"
+    static let saverShuffle = "saverShuffle"
+    static let saverClock = "saverClock"
+    static let saverCaptions = "saverCaptions"
+    static let saverSound = "saverSound"
+    static let saverVolume = "saverVolume"
+    static let saverLock = "saverLock"
+    static let saverSystem = "saverSystem"
+    static let saverOff = "saverOff"
     // Internal state, not shown in Settings.
     static let savedSession = "savedSession"
     static let resumeNext = "resumeNext"
     static let restoreVolume = "restoreVolume"
     static let sessions = "sessions"
     static let thanked = "thanked"
+    static let latitude = "latitude"
+    static let longitude = "longitude"
+    static let place = "place"
 }
 
 let donateURL = URL(string: "https://paypal.me/theblindiephoenix")!
@@ -54,6 +67,12 @@ enum Prefs {
             Key.nightlyAction: PowerAction.sleep.rawValue,
             Key.nightlyMinutes: 60,
             Key.nightlyWaitIdle: true,
+            Key.saverShortcut: Shortcut.screensaver.raw,
+            Key.saverIdle: 10,
+            Key.saverShuffle: 10,
+            Key.saverClock: true,
+            Key.saverCaptions: true,
+            Key.saverVolume: 0.6,
         ])
     }
 
@@ -80,6 +99,17 @@ enum Prefs {
     static var nightlyWaitIdle: Bool { d.bool(forKey: Key.nightlyWaitIdle) }
     static var onShortcut: String { d.string(forKey: Key.onShortcut) ?? "" }
     static var offShortcut: String { d.string(forKey: Key.offShortcut) ?? "" }
+    static var saverShortcut: Shortcut? { Shortcut(raw: d.string(forKey: Key.saverShortcut) ?? "") }
+    static var saverIdle: Int { d.integer(forKey: Key.saverIdle) }
+    static var saverShuffle: Int { d.integer(forKey: Key.saverShuffle) }
+    static var saverClock: Bool { d.bool(forKey: Key.saverClock) }
+    static var saverCaptions: Bool { d.bool(forKey: Key.saverCaptions) }
+    static var saverSound: Bool { d.bool(forKey: Key.saverSound) }
+    static var saverVolume: Float { d.float(forKey: Key.saverVolume) }
+    static var saverLock: Bool { d.bool(forKey: Key.saverLock) }
+    static var saverSystem: Bool { d.bool(forKey: Key.saverSystem) }
+    /// Scenes left out of the shuffle. Stored as the ones switched off, so new scenes start switched on.
+    static var saverOff: [String] { d.stringArray(forKey: Key.saverOff) ?? [] }
 }
 
 enum AwayAction: String, CaseIterable, Identifiable {

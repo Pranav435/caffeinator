@@ -1,0 +1,125 @@
+// Packs Natural Earth's 1:50m land polygons and large lakes (public domain, naturalearthdata.com) into
+// Sources/Caffeinator/Scenes/Earth/EarthShapes.swift for the globe scenes. The app rasterises them at runtime.
+// Run from the repo root: swift scripts/make-earth.swift
+import Foundation
+
+let base = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/"
+let tolerance = 0.02          // Douglas-Peucker tolerance, degrees (the runtime raster is 0.088 degrees a texel)
+let unit = 0.01               // quantisation step, degrees
+let minLakeArea = 0.08        // square degrees; smaller lakes vanish at globe scale anyway
+
+typealias Ring = [SIMD2<Double>]
+
+func download(_ name: String) -> Data {
+    let url = URL(string: base + name)!
+    let done = DispatchSemaphore(value: 0)
+    nonisolated(unsafe) var result: Data?
+    URLSession.shared.dataTask(with: url) { data, response, error in
+        if let data, (response as? HTTPURLResponse)?.statusCode == 200 { result = data } else { print("\(name): \(error?.localizedDescription ?? "bad response")") }
+        done.signal()
+    }.resume()
+    done.wait()
+    guard let result else { exit(1) }
+    print("\(name): \(result.count) bytes")
+    return result
+}
+
+/// Every polygon in a GeoJSON feature collection, as rings (outer first, then holes).
+func polygons(_ data: Data) -> [[Ring]] {
+    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let features = root["features"] as? [[String: Any]] else { fatalError("not GeoJSON") }
+    var out: [[Ring]] = []
+    for feature in features {
+        guard let g = feature["geometry"] as? [String: Any], let type = g["type"] as? String else { continue }
+        let raw: [Any] = type == "Polygon" ? [g["coordinates"] as Any] : (g["coordinates"] as? [Any] ?? [])
+        for polygon in raw {
+            guard let rings = polygon as? [[[Double]]] else { continue }
+            out.append(rings.map { $0.compactMap { $0.count >= 2 ? SIMD2($0[0], $0[1]) : nil } })
+        }
+    }
+    return out
+}
+
+func area(_ r: Ring) -> Double {
+    var a = 0.0
+    for i in r.indices { let p = r[i], q = r[(i + 1) % r.count]; a += p.x * q.y - q.x * p.y }
+    return abs(a) / 2
+}
+
+func simplify(_ pts: ArraySlice<SIMD2<Double>>) -> [SIMD2<Double>] {
+    guard pts.count > 2, let first = pts.first, let last = pts.last else { return Array(pts) }
+    let d = last - first, len = (d * d).sum().squareRoot()
+    var worst = 0.0, index = pts.startIndex
+    for i in pts.indices.dropFirst().dropLast() {
+        let v = pts[i] - first
+        let dist = len > 0 ? abs(v.x * d.y - v.y * d.x) / len : (v * v).sum().squareRoot()
+        if dist > worst { worst = dist; index = i }
+    }
+    if worst <= tolerance { return [first, last] }
+    return simplify(pts[pts.startIndex...index]).dropLast() + simplify(pts[index...])
+}
+
+/// Simplifies a closed ring by splitting it at the point farthest from its start.
+func simplifyRing(_ r: Ring) -> Ring {
+    var ring = r
+    if ring.count > 1, ring.first == ring.last { ring.removeLast() }
+    guard ring.count > 3 else { return ring }
+    let far = ring.indices.max { ((ring[$0] - ring[0]) * (ring[$0] - ring[0])).sum() < ((ring[$1] - ring[0]) * (ring[$1] - ring[0])).sum() }!
+    let a = simplify(ring[0...far]), b = simplify((ring[far...] + [ring[0]])[...])
+    return Array(a.dropLast() + b.dropLast())
+}
+
+var bytes: [UInt8] = []
+func varint(_ v: UInt64) {
+    var v = v
+    while v >= 0x80 { bytes.append(UInt8(v & 0x7f) | 0x80); v >>= 7 }
+    bytes.append(UInt8(v))
+}
+func zigzag(_ v: Int64) { varint(UInt64(bitPattern: (v << 1) ^ (v >> 63))) }
+
+let land = polygons(download("ne_50m_land.geojson"))
+let lakes = polygons(download("ne_50m_lakes.geojson")).filter { area($0[0]) >= minLakeArea }
+// Water rings: the holes in land (the Caspian Sea) and the larger lakes.
+var rings: [(water: Bool, ring: Ring)] = land.flatMap { p in p.enumerated().map { ($0.offset > 0, $0.element) } }
+rings += lakes.map { (true, $0[0]) }
+
+var kept = 0, points = 0
+var previous = SIMD2<Int64>(0, 0)
+var encoded: [(Bool, [SIMD2<Int64>])] = []
+for (water, ring) in rings {
+    var q = simplifyRing(ring).map { SIMD2(Int64(($0.x / unit).rounded()), Int64(($0.y / unit).rounded())) }
+    q = q.enumerated().filter { $0.offset == 0 || $0.element != q[$0.offset - 1] }.map(\.element)
+    guard q.count >= 3 else { continue }
+    encoded.append((water, q))
+}
+varint(UInt64(encoded.count))
+for (water, q) in encoded {
+    varint(UInt64(q.count) << 1 | (water ? 1 : 0))
+    for p in q {
+        zigzag(p.x - previous.x)
+        zigzag(p.y - previous.y)
+        previous = p
+    }
+    kept += 1
+    points += q.count
+}
+
+let b64 = Data(bytes).base64EncodedString()
+var lines: [Substring] = []
+var rest = Substring(b64)
+while !rest.isEmpty { lines.append(rest.prefix(120)); rest = rest.dropFirst(120) }
+let swift = """
+// Generated by scripts/make-earth.swift from Natural Earth 1:50m land and lakes (public domain). Do not edit.
+
+extension Globe {
+    /// \(kept) rings, \(points) points: a varint ring count, then per ring varint (count << 1 | water) and
+    /// zigzag-varint deltas of longitude and latitude in hundredths of a degree.
+    static let shapes = \"\"\"
+\(lines.map { "    " + $0 }.joined(separator: "\n"))
+    \"\"\"
+}
+
+"""
+let out = URL(fileURLWithPath: "Sources/Caffeinator/Scenes/Earth/EarthShapes.swift")
+try! swift.write(to: out, atomically: true, encoding: .utf8)
+print("\(kept) rings (\(lakes.count) lakes), \(points) points, \(bytes.count) bytes, \(b64.count) base64 characters")

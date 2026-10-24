@@ -22,6 +22,8 @@ mkdir -p "$stage/Contents/MacOS" "$stage/Contents/Resources"
 # SwiftPM records the deployment target as the SDK version. Stamp the real one so
 # newer macOS releases don't run the app in compatibility mode.
 vtool -set-build-version macos 14.0 "$(xcrun --show-sdk-version)" -replace -output "$stage/Contents/MacOS/Caffeinator" "$bin/Caffeinator"
+# Debug and local symbols are a third of the binary, and nothing reads them on a user's Mac.
+strip -S -x "$stage/Contents/MacOS/Caffeinator"
 cp Resources/Info.plist "$stage/Contents/"
 cp Resources/AppIcon.icns "$stage/Contents/Resources/"
 plutil -replace CFBundleShortVersionString -string "$version" "$stage/Contents/Info.plist"

@@ -7,6 +7,7 @@ struct Shortcut: Equatable {
     var mods: UInt32
 
     static let `default` = Shortcut(keyCode: UInt32(kVK_ANSI_Z), mods: UInt32(optionKey | cmdKey))
+    static let screensaver = Shortcut(keyCode: UInt32(kVK_ANSI_A), mods: UInt32(optionKey | cmdKey))
 
     init(keyCode: UInt32, mods: UInt32) {
         self.keyCode = keyCode
@@ -86,20 +87,33 @@ struct Shortcut: Equatable {
     }
 }
 
-/// System-wide hotkey through Carbon's RegisterEventHotKey, which needs no Accessibility permission.
+/// System-wide hotkeys through Carbon's RegisterEventHotKey, which needs no Accessibility permission.
 @MainActor final class HotKey {
-    static let shared = HotKey()
+    /// Turns Caffeinator on and off.
+    static let toggle = HotKey(id: 1)
+    /// Starts and stops the screensaver.
+    static let screensaver = HotKey(id: 2)
+    static let all = [toggle, screensaver]
+
     var action: () -> Void = {}
     private(set) var shortcut: Shortcut?
     /// True when another app already owns the combination.
     private(set) var failed = false
+    private let id: UInt32
     private var ref: EventHotKeyRef?
-    private var suspended = false
+    private static var suspended = false
+    private static var installed = false
 
-    private init() {
+    private init(id: UInt32) {
+        self.id = id
+        guard !Self.installed else { return }
+        Self.installed = true
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-            MainActor.assumeIsolated { HotKey.shared.action() }
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+            var pressed = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil,
+                              MemoryLayout<EventHotKeyID>.size, nil, &pressed)
+            MainActor.assumeIsolated { HotKey.all.first { $0.id == pressed.id }?.action() }
             return noErr
         }, 1, &spec, nil, nil)
     }
@@ -109,16 +123,16 @@ struct Shortcut: Equatable {
         apply()
     }
 
-    /// Releases the combination while the Settings recorder listens for a new one.
-    func suspend() { suspended = true; apply() }
-    func resume() { suspended = false; apply() }
+    /// Releases every combination while a Settings recorder listens for a new one.
+    static func suspend() { suspended = true; all.forEach { $0.apply() } }
+    static func resume() { suspended = false; all.forEach { $0.apply() } }
 
     private func apply() {
         if let ref { UnregisterEventHotKey(ref) }
         ref = nil
         failed = false
-        guard !suspended, let shortcut else { return }
-        let id = EventHotKeyID(signature: OSType(0x4341_4646), id: 1) // 'CAFF'
-        failed = RegisterEventHotKey(shortcut.keyCode, shortcut.mods, id, GetApplicationEventTarget(), 0, &ref) != noErr
+        guard !Self.suspended, let shortcut else { return }
+        let hotKeyID = EventHotKeyID(signature: OSType(0x4341_4646), id: id) // 'CAFF'
+        failed = RegisterEventHotKey(shortcut.keyCode, shortcut.mods, hotKeyID, GetApplicationEventTarget(), 0, &ref) != noErr
     }
 }

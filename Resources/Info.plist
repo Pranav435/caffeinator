@@ -20,8 +20,6 @@
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>1.0.0</string>
-	<key>CFBundleVersion</key>
-	<string>1</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -33,6 +31,8 @@
 			</array>
 		</dict>
 	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>
@@ -43,5 +43,9 @@
 	<string>Caffeinator asks macOS to log out, restart or shut down when you tell it to.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>MIT License</string>
+	<key>NSLocationUsageDescription</key>
+	<string>The screensaver's sky scenes show the sky, weather and satellites over where you are.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>The screensaver's sky scenes show the sky, weather and satellites over where you are.</string>
 </dict>
 </plist>

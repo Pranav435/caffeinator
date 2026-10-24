@@ -12,12 +12,20 @@ enum Until: Equatable {
     let triggers = Triggers()
     let scheduler = Scheduler()
     var onChange: () -> Void = {}
+    /// Runs on every 30-second tick, so the screensaver can start itself after the user goes idle.
+    var onTick: () -> Void = {}
+    /// Called just before the away guard acts.
+    var onAway: () -> Void = {}
 
     private(set) var manual = false
     private(set) var end: Date?
     private(set) var until: Until?
     private(set) var then: PowerAction?
     private var thenMinWarning = 0
+    /// The screensaver is showing. It keeps the display awake on its own, without touching the session.
+    private(set) var screensaver = false
+    /// The user started the screensaver by hand, so the away guard leaves it alone.
+    private var screensaverPinned = false
 
     /// Triggers the user turned off by hand. Each one comes back once its condition clears.
     private var paused: Set<String> = []
@@ -35,7 +43,7 @@ enum Until: Equatable {
     private var quietTicks = 0
 
     var reasons: [String] { triggers.active.filter { !paused.contains($0) } }
-    var isAwake: Bool { !awaySuspended && (manual || !reasons.isEmpty) }
+    var isAwake: Bool { !awaySuspended && (manual || screensaver || !reasons.isEmpty) }
 
     func launch() {
         triggers.onChange = { [weak self] in self?.triggersChanged() }
@@ -108,6 +116,14 @@ enum Until: Equatable {
         end = max(current, .now) + Double(minutes * 60)
         arm()
         changed("\(Fmt.spoken(end!.timeIntervalSinceNow)) left")
+    }
+
+    /// The screensaver holds the display awake while it shows. Ending it leaves keep-awake as it was before.
+    func setScreensaver(_ on: Bool, pinned: Bool = false) {
+        screensaver = on
+        screensaverPinned = on && pinned
+        if on { awaySuspended = false }
+        changed()
     }
 
     func setThen(_ action: PowerAction?, minWarning: Int = 0) {
@@ -194,7 +210,8 @@ enum Until: Equatable {
     }
 
     private func applyAssertion() {
-        let type = isAwake ? (Prefs.keepDisplayOn ? kIOPMAssertPreventUserIdleDisplaySleep : kIOPMAssertPreventUserIdleSystemSleep) : nil
+        let display = Prefs.keepDisplayOn || screensaver
+        let type = isAwake ? (display ? kIOPMAssertPreventUserIdleDisplaySleep : kIOPMAssertPreventUserIdleSystemSleep) : nil
         guard type != assertionType else { return }
         if assertion != 0 { IOPMAssertionRelease(assertion) }
         assertion = 0
@@ -246,6 +263,7 @@ enum Until: Equatable {
         checkAway()
         if manual, until == .activity { checkActivity() }
         if end != nil { onChange() }
+        onTick()
     }
 
     private func checkAway() {
@@ -259,8 +277,9 @@ enum Until: Equatable {
             return
         }
         let minutes = Prefs.awayMinutes
-        guard minutes > 0, isAwake, !awayFired, idle >= Double(minutes * 60) else { return }
+        guard minutes > 0, isAwake, !screensaverPinned, !awayFired, idle >= Double(minutes * 60) else { return }
         awayFired = true
+        onAway()
         switch Prefs.awayAction {
         case .lock: Power.perform(.lock)
         case .display: Power.perform(.displayOff)
@@ -300,6 +319,7 @@ enum Until: Equatable {
             } else {
                 parts += reasons
             }
+            if screensaver { parts.append("screensaver") }
         }
         if let p = scheduler.pending { parts.append("\(p.action.title) at \(Fmt.clock(p.date))") }
         return parts.joined(separator: spoken ? ", " : " · ")
