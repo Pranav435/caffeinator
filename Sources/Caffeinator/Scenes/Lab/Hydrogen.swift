@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import Metal
 
 /// Exact hydrogen wavefunctions ψ_nlm = R_nl(r) Y_lm(θ, φ) in atomic units (lengths in Bohr radii).
@@ -173,8 +174,10 @@ struct Orbital: Equatable {
     private let flow: MTLComputePipelineState
     private let march: MTLRenderPipelineState
     private let dots: MTLRenderPipelineState
-    private let tone: MTLRenderPipelineState
-    private let bloom: Bloom
+    private let lens: Lens
+    private let strip: MTLRenderPipelineState
+    private var labelled = -2
+    private var labelledSize = CGSize.zero
     private let dust: MTLBuffer
     private var volumes: [MTLTexture]
     private var light: MTLTexture?
@@ -201,7 +204,8 @@ struct Orbital: Equatable {
         let line = Self.line(s.a.n, b.n)
         let thz = Int((Self.frequency(s.a, b) / 1e12).rounded()).formatted()
         let motion = b.m != s.a.m ? "circles the nucleus" : "sloshes back and forth"
-        return "Superposition of \(s.a.label) and \(b.label): the charge \(motion) at the \(line) frequency, \(thz) terahertz, shown 10 quadrillion times slower"
+        let nm = 1e9 * 299_792_458 / Self.frequency(s.a, b)
+        return "Superposition of \(s.a.label) and \(b.label): the charge \(motion) at the \(line) frequency, \(thz) terahertz (\(Int(nm.rounded())) nanometres), shown 10 quadrillion times slower"
     }
 
     nonisolated static func eV(_ e: Double) -> String {
@@ -226,8 +230,8 @@ struct Orbital: Equatable {
         flow = try gpu.kernel(library, "orbitalDust")
         march = try gpu.pipeline(library, "orbitalMarch")
         dots = try gpu.pipeline(library, "sprite", vertex: "orbitalMote", blend: .add)
-        tone = try gpu.pipeline(library, "orbitalTone")
-        bloom = try Bloom(gpu: gpu)
+        lens = try Lens(gpu: gpu)
+        strip = try gpu.pipeline(library, "orbitalStrip", blend: .add)
         let d = MTLTextureDescriptor()
         d.textureType = .type3D
         d.pixelFormat = .rgba16Float
@@ -303,7 +307,7 @@ struct Orbital: Equatable {
         let eye = SIMD3<Float>(cos(angle) * cos(lift), sin(lift), sin(angle) * cos(lift)) * 3.3
         let drift = SIMD2<Float>(0.08 * sin(f.time * 0.013), 0.06 * sin(f.time * 0.017 + 1))
         let u = f.uniforms(params[current], params[1 - current], SIMD4(eye, eased),
-                           SIMD4(drift.x, drift.y, 3.1, gammas[1 - current] + (gammas[current] - gammas[1 - current]) * eased))
+                           SIMD4(drift.x, drift.y, 3.3, gammas[1 - current] + (gammas[current] - gammas[1 - current]) * eased))
 
         var m = u
         m.b = SIMD4(f.dt * Float(Self.atomicTime), f.dt, switched ? 1 : 0, Float(f.index))
@@ -312,10 +316,40 @@ struct Orbital: Equatable {
 
         f.cmd.draw(march, into: light!, uniforms: u, textures: [volumes[current], volumes[1 - current]])
         f.cmd.draw(dots, into: light!, clear: false, uniforms: u, buffers: [dust], vertices: Self.motes, primitive: .point)
-        let glow = bloom.glow(f.cmd, light!)
-        f.cmd.draw(tone, into: f.target, uniforms: u, textures: [light!, glow])
+        let line = Self.balmerLine(s)
+        f.cmd.draw(strip, into: light!, clear: false, uniforms: f.uniforms(SIMD4(Float(line), 0, 0, 0)))
+        labelSpectrum(f, line)
+        lens.develop(f, light!, Lens.Look(exposure: 1.0, white: [0.97, 1.0, 0.99], bloom: 0.08, halation: 0.01, vignette: 0.5,
+                                          aberration: 1.0, grain: 0.8))
 
         if let synth = f.sound { play(synth, s, params[current].z) }
+    }
+
+    static let balmer: [(nm: Double, name: String)] = [(656.3, "Hα"), (486.1, "Hβ"), (434.0, "Hγ"), (410.2, "Hδ")]
+
+    /// Which Balmer line (0 to 3) the state's transition or decay goes through, or -1.
+    nonisolated static func balmerLine(_ s: State) -> Int {
+        let hi: Int
+        if let b = s.b { guard min(s.a.n, b.n) == 2 else { return -1 }; hi = max(s.a.n, b.n) } else { hi = s.a.n }
+        return (3...6).contains(hi) ? hi - 3 : -1
+    }
+
+    /// Small captions under the spectrum strip, redrawn only when the highlighted line or the display changes.
+    private func labelSpectrum(_ f: Frame, _ line: Int) {
+        let size = f.overlay.size
+        guard line != labelled || size != labelledSize else { return }
+        labelled = line
+        labelledSize = size
+        f.overlay.draw { ctx, size in
+            for (i, l) in Self.balmer.enumerated() {
+                let x = (0.27 + 0.46 * (l.nm - 400) / 300) * size.width
+                let hot = i == line
+                ctx.text(String(format: "%.1f", l.nm), at: CGPoint(x: x, y: 0.958 * size.height), size: 9, weight: hot ? .semibold : .regular,
+                         mono: true, color: NSColor(white: 1, alpha: hot ? 0.75 : 0.4), anchor: CGPoint(x: 0.5, y: 0))
+            }
+            ctx.text("H I  BALMER SERIES  nm", at: CGPoint(x: 0.27 * size.width, y: 0.9 * size.height), size: 9, mono: true,
+                     color: NSColor(white: 1, alpha: 0.35), anchor: CGPoint(x: 0, y: 1), tracking: 1)
+        }
     }
 
     /// Folds a frequency by octaves into [lo, 2 lo).
@@ -480,6 +514,48 @@ struct Orbital: Equatable {
 
     inline float3 toWorld(float3 o) { return float3(o.x, o.z, -o.y); }
 
+    // The reference spectrum of a hydrogen discharge tube: the four visible Balmer lines in their true colours, the
+    // highlighted one (u.a.x, or -1) brighter. A thin strip along the bottom, drawn straight into the light.
+    inline float3 wavelengthColor(float nm) {
+        float3 c = float3(0);
+        if (nm < 440) c = float3(-(nm - 440) / 60, 0, 1);
+        else if (nm < 490) c = float3(0, (nm - 440) / 50, 1);
+        else if (nm < 510) c = float3(0, 1, -(nm - 510) / 20);
+        else if (nm < 580) c = float3((nm - 510) / 70, 1, 0);
+        else if (nm < 645) c = float3(1, -(nm - 645) / 65, 0);
+        else c = float3(1, 0, 0);
+        float k = nm < 420 ? 0.3 + 0.7 * (nm - 380) / 40 : (nm > 700 ? 0.3 + 0.7 * (780 - nm) / 80 : 1.0);
+        return pow(c * k, 2.2);
+    }
+
+    fragment float4 orbitalStrip(V in [[stage_in]], constant U &u [[buffer(0)]]) {
+        float2 t = in.uv;
+        float x = (t.x - 0.27) / 0.46;
+        float y = (t.y - 0.915) / 0.03;
+        if (x < -0.02 || x > 1.02 || y < -0.05 || y > 1.3) return float4(0);
+        float3 c = 0;
+        float nm = 400 + 300 * x;
+        float pxnm = 300.0 / (0.46 * u.res.x);
+        if (y >= 0 && y <= 1) {
+            const float lines[4] = {656.3, 486.1, 434.0, 410.2};
+            const float rel[4] = {1.0, 0.6, 0.45, 0.4};
+            c = float3(0.004, 0.004, 0.005) + float3(0.012) * hash12(in.pos.xy);
+            for (int i = 0; i < 4; i++) {
+                float sigma = max(1.8, 1.4 * pxnm);
+                float g = exp(-0.5 * sq((nm - lines[i]) / sigma));
+                float boost = (int(u.a.x) == i) ? 2.6 : 1.0;
+                c += wavelengthColor(lines[i]) * g * rel[i] * boost * 2.2;
+            }
+            float e = min(min(x, 1 - x) * 0.46 * u.res.x, min(y, 1 - y) * 0.03 * u.res.y);
+            c += 0.03 * step(e, 1.0);
+        } else if (y > 1 && y < 1.2) {
+            // Wavelength ticks every 50 nm.
+            float tick = abs(fract(nm / 50 + 0.5) - 0.5) * 50 / max(pxnm, 1e-3);
+            c = float3(0.12) * step(tick, 0.8);
+        }
+        return float4(c, 1);
+    }
+
     // Draws each mote as a soft point, fading in and out over its life. c: eye and fade, d: drift and zoom.
     vertex P orbitalMote(uint id [[vertex_id]], constant U &u [[buffer(0)]], const device float4 *dust [[buffer(1)]]) {
         float4 p = dust[2 * id], q = dust[2 * id + 1];
@@ -488,7 +564,9 @@ struct Orbital: Equatable {
         o.size = 2.6 * u.res.y / 600;
         float life = smoothstep(0.0, 0.8, p.w) * smoothstep(q.x, q.x - 1.2, p.w);
         float b = life * (q.w > 0 ? 1.0 : 0.0) * 0.6 * (0.3 + 0.7 * q.w);
-        o.color = float4(phaseColor(q.yz, 0.17) * b, 0);
+        o.color = float4(float3(0.55, 1.0, 0.7) * b * 2.4, 0);
+        float2 dp = o.pos.xy / o.pos.w * float2(u.res.x / u.res.y, 1) - float2(0, 0.06);
+        if (length(dp) > 0.79) o.color = 0;
         return o;
     }
 
@@ -498,7 +576,7 @@ struct Orbital: Equatable {
         float2 p = centered(in.uv, u.res);
         float3 eye = u.c.xyz;
         float3 rd = ray(p, eye, float3(u.d.xy, 0), u.d.z);
-        float3 bg = float3(0.005, 0.006, 0.011) * (1 - 0.3 * dot(p, p));
+        float3 bg = float3(0.003, 0.005, 0.004) * (1 - 0.3 * dot(p, p));
         float2 hit = sphere(eye, rd, float3(0), 1);
         if (hit.y <= 0) return float4(bg, 1);
         const int steps = 96;
@@ -522,19 +600,28 @@ struct Orbital: Equatable {
             glow += e;
             tint += e * dir;
             hot += trans * ds * (smoothstep(0.35, 1.0, r) + shell * 0.25);
-            trans *= exp(-r * ds * 3.5);
+            trans *= exp(-r * ds * 0.6);
             if (trans < 0.01) break;
         }
-        float chroma = length(tint) / max(glow, 1e-5);
-        float3 c = phaseColor(tint / max(length(tint), 1e-6), 0.2 * chroma) * glow * 1.4 + float3(1.0, 0.96, 0.92) * hot * 0.3;
+        // A detector image: the column density in phosphor green, with counting noise and a micro-channel-plate pore mesh,
+        // inside a round active area with a machined bezel.
+        float2 pg = in.pos.xy / max(u.res.y / 540, 1.0);
+        float2 hex = float2(pg.x / 5.0, pg.y / 4.33 + 0.5 * floor(pg.x / 5.0));
+        float2 cellp = fract(hex) - 0.5;
+        float pore = 0.7 + 0.3 * smoothstep(0.5, 0.2, length(cellp * float2(1.0, 0.9)));
+        float shot = 0.5 + 1.0 * hash12(floor(pg) + float2(u.frame % 7u, 0));
+        float3 c = float3(0.55, 1.0, 0.7) * (glow * 0.9 + hot * 0.08) * pore * shot + float3(0.45, 1.0, 0.6) * 0.012 * pore;
+        float2 dp = p - float2(0, 0.06);
+        float dd = length(dp) - 0.8;
+        if (dd > 0) {
+            float ring = exp(-abs(dd - 0.012) / 0.006);
+            float brushed = 0.6 + 0.4 * noise(float2(atan2(dp.y, dp.x) * 90.0, floor(dd * 40.0)));
+            float side = 0.5 + 0.5 * dot(normalize(dp), normalize(float2(-0.6, 0.8)));
+            c = float3(0.05, 0.052, 0.056) * brushed * (0.4 + side) + float3(0.5, 0.52, 0.55) * ring * 0.28 * side;
+            trans = 0;
+            bg = 0;
+        }
         return float4(bg * trans + c, 1);
-    }
-
-    fragment float4 orbitalTone(V in [[stage_in]], constant U &u [[buffer(0)]], texture2d<float> light [[texture(0)]],
-                                texture2d<float> glow [[texture(1)]]) {
-        constexpr sampler s(filter::linear, address::clamp_to_edge);
-        float3 c = light.sample(s, in.uv).rgb + glow.sample(s, in.uv).rgb * 0.3;
-        return float4(film(c), 1);
     }
     """
 }

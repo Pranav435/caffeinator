@@ -26,6 +26,7 @@ import Metal
         Target(name: "the period-doubling cascade", re: MandelbrotDD("-1.3900"), im: MandelbrotDD("0.0200"), region: 0.02),
     ]
 
+    private static let look = Lens.Look(exposure: 1.9, white: [1.03, 1, 0.95], bloom: 0.03, halation: 0.03, vignette: 0.5, aberration: 1.4, grain: 0.6)
     private static let startWidth = 3.4
     private static let finalWidth = 2e-13
     private static let zoomSeconds = 205.0
@@ -36,8 +37,10 @@ import Metal
     private let shade: MTLRenderPipelineState
     private let expose: MTLRenderPipelineState
     private let bloom: Bloom
+    private let lens: Lens
     private let gpu: GPU
     private var hdr: MTLTexture?
+    private var shot: MTLTexture?
     private var keys: [MTLTexture] = []
     private let stats: [MTLBuffer]
     private var slotLevel = [-1, -1, -1]
@@ -87,6 +90,7 @@ import Metal
         shade = try gpu.pipeline(library, "mandelShade")
         expose = try gpu.pipeline(library, "mandelExpose")
         bloom = try Bloom(gpu: gpu)
+        lens = try Lens(gpu: gpu)
         stats = (0..<3).map { _ in gpu.buffer(32) }
         rng = UInt64.random(in: 1...UInt64.max)
         if let v = Snapshot.variant { rng = UInt64(v + 1) &* 0x9E37_79B9_7F4A_7C15 }
@@ -152,13 +156,15 @@ import Metal
     func draw(_ f: Frame) {
         if hdr?.width != f.target.width || hdr?.height != f.target.height {
             hdr = f.gpu.texture(f.target.width, f.target.height)
+            shot = f.gpu.texture(f.target.width, f.target.height)
             keys = (0..<3).map { _ in f.gpu.texture(f.target.width, f.target.height, .rg32Float) }
             slotLevel = [-1, -1, -1]
             rendering = -1
             done = -1
         }
         guard target != nil, let reference else {
-            f.cmd.draw(expose, into: f.target, uniforms: f.uniforms(), textures: [hdr!, hdr!])
+            f.cmd.draw(expose, into: shot!, uniforms: f.uniforms(), textures: [hdr!, hdr!])
+            lens.develop(f, shot!, Self.look)
             f.sound?.reset()
             return
         }
@@ -203,8 +209,9 @@ import Metal
         if outer >= 0, inner >= 0 {
             f.cmd.draw(shade, into: hdr!, uniforms: u, textures: [keys[outer], keys[inner]])
         }
-        let glow = bloom.glow(f.cmd, hdr!)
-        f.cmd.draw(expose, into: f.target, uniforms: u, textures: [hdr!, glow])
+        let soft = bloom.glow(f.cmd, hdr!, levels: 2)
+        f.cmd.draw(expose, into: shot!, uniforms: u, textures: [hdr!, soft])
+        lens.develop(f, shot!, Self.look)
 
         if let synth = f.sound { play(synth, f) }
     }
@@ -366,38 +373,55 @@ import Metal
         return Texel{v.x, exp2(float(h.x)), float(h.y)};
     }
 
-    // Three cyclic gradients in linear light: ember and ice, aurora, nacre.
-    constant float3 inks[3][5] = {
-        {float3(0.010, 0.030, 0.140), float3(0.000, 0.330, 0.480), float3(1.000, 0.720, 0.300), float3(0.780, 0.160, 0.040), float3(0.260, 0.030, 0.220)},
-        {float3(0.010, 0.050, 0.090), float3(0.030, 0.560, 0.330), float3(0.320, 0.820, 0.900), float3(0.340, 0.130, 0.620), float3(0.720, 0.080, 0.380)},
-        {float3(0.050, 0.015, 0.090), float3(0.820, 0.300, 0.420), float3(1.000, 0.820, 0.560), float3(0.060, 0.480, 0.520), float3(0.100, 0.070, 0.380)},
-    };
-
-    inline float3 gradient(float t, int p) {
-        t = fract(t) * 5;
-        int i = int(t);
-        float f = smoothstep(0.0, 1.0, fract(t));
-        return mix(inks[p][i], inks[p][(i + 1) % 5], f);
+    // Reflectance of a thin transparent film of thickness `t` nanometres on bright metal: two-beam interference, which
+    // washes toward grey as the orders pile up. This is where anodised titanium and oil on steel get their colours.
+    inline float3 thinFilm(float t, float wash) {
+        const float3 lambda = float3(640.0, 545.0, 455.0);
+        float3 ph = 4 * M_PI_F * 1.45 * t / lambda;
+        float3 c = 0.5 - 0.5 * cos(ph) * exp(-t * wash);
+        return pow(c, 2.2);
     }
 
-    // Colour of one texel: hue from the smooth iteration count, brightness from the distance to the set, so
-    // filaments glow, and relief from the derivative's direction. `px` converts the distance to display pixels.
-    float3 tint(Texel t, float px, constant U &u) {
-        if (!(t.nu >= 0)) return float3(0);
-        float de = t.de * px;
-        float3 base = gradient(log2(t.nu) * 0.9 + u.b.x, int(u.b.z));
-        float glow = 1 / pow(1 + de * 0.5, 1.5);
-        float lit = 0.3 + 0.7 * pow(saturate(t.slope * 0.5 + 0.5), 1.4);
-        float3 c = base * (0.035 + 1.05 * glow) * lit;
-        c += float3(0.9, 0.85, 0.8) * pow(saturate(t.slope), 12) * glow * 0.25;
-        return c;
+    // The plate's height at a texel: the set is a pocket, and its rim rises over a few pixels to the surface.
+    inline float plate(Texel t, float px) {
+        return t.nu < 0 ? 0.0 : 1 - exp(-t.de * px / 6.0);
     }
 
-    float3 sampleKey(texture2d<float> t, float2 q, float px, constant U &u) {
+    // Light off one texel of the plate: thin-film colour on the surface, black anodised in the pocket, a softbox and a
+    // lacquer highlight reflected in the bevels. The film's thickness follows the escape time, and the colour shifts
+    // with the angle the bevel is seen from.
+    float3 tint(texture2d<float> t, int2 q, float px, float2 uv, constant U &u) {
+        Texel c = fetch(t, q);
+        float h0 = plate(fetch(t, q + int2(1, 0)), px) - plate(fetch(t, q - int2(1, 0)), px);
+        float h1 = plate(fetch(t, q + int2(0, 1)), px) - plate(fetch(t, q - int2(0, 1)), px);
+        float3 n = normalize(float3(-h0 * 2.2, -h1 * 2.2, 1));
+        float3 r = reflect(float3(0, 0, -1), n);
+        const float3 key = float3(-0.5, -0.62, 0.6) * 1.0;
+        float3 L = normalize(key);
+        float box = smoothstep(0.55, 0.93, dot(r, L));
+        float sky = 0.5 + 0.5 * saturate(-r.y);
+        float pool = 0.5 + 0.7 * exp(-dot(uv - float2(0.38, 0.36), uv - float2(0.38, 0.36)) * 3.5);
+        float env = (0.10 * sky + 1.5 * box) * pool;
+        float spec = pow(saturate(dot(r, L)), 60.0) * 0.5;
+        int p = int(u.b.z);
+        float thick = 300 + (p == 1 ? 40 : p == 2 ? 95 : 0) + 50 * sqrt(max(c.nu, 0.0)) + 60 * u.b.x;
+        thick /= max(n.z, 0.6);
+        if (!(c.nu >= 0)) {
+            float pit = 0.02 + 0.05 * thinFilm(520 + 60 * u.b.x, 0.0).g;
+            return pit * (0.15 + env) + spec * 0.35;
+        }
+        float3 film = thinFilm(thick, 0.0006) * 1.6;
+        // Bare brushed metal away from the set; the film colours only where the relief is.
+        float3 metal = float3(0.62, 0.60, 0.57) * (0.92 + 0.08 * noise(float2(q) * float2(0.35, 5.0)));
+        float w = exp(-c.de * px / 18.0) * 0.6;
+        return mix(metal, film, w) * env + spec;
+    }
+
+    float3 sampleKey(texture2d<float> t, float2 q, float px, float2 uv, constant U &u) {
         float2 i = floor(q), f = q - i;
         int2 b = int2(i);
-        float3 c00 = tint(fetch(t, b), px, u), c10 = tint(fetch(t, b + int2(1, 0)), px, u);
-        float3 c01 = tint(fetch(t, b + int2(0, 1)), px, u), c11 = tint(fetch(t, b + int2(1, 1)), px, u);
+        float3 c00 = tint(t, b, px, uv, u), c10 = tint(t, b + int2(1, 0), px, uv, u);
+        float3 c01 = tint(t, b + int2(0, 1), px, uv, u), c11 = tint(t, b + int2(1, 1), px, uv, u);
         return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
     }
 
@@ -410,16 +434,19 @@ import Metal
         float2 edge = min(qi, size - 1 - qi);
         float wi = smoothstep(1.0, 12.0, min(edge.x, edge.y));
         float3 c = 0;
-        if (wi < 1) c = sampleKey(outer, o * u.a.x + size * 0.5 - 0.5, 1 / u.a.x, u) * (1 - wi);
-        if (wi > 0) c += sampleKey(inner, qi, 1 / u.a.y, u) * wi;
+        if (wi < 1) c = sampleKey(outer, o * u.a.x + size * 0.5 - 0.5, 1 / u.a.x, in.uv, u) * (1 - wi);
+        if (wi > 0) c += sampleKey(inner, qi, 1 / u.a.y, in.uv, u) * wi;
         return float4(c, 1);
     }
 
+    // Shallow depth of field: the plate is focused along a tilted band, and falls into the blurred copy either side.
     fragment float4 mandelExpose(V in [[stage_in]], constant U &u [[buffer(0)]], texture2d<float> hdr [[texture(0)]],
-                                 texture2d<float> glow [[texture(1)]]) {
+                                 texture2d<float> soft [[texture(1)]]) {
         constexpr sampler s(filter::linear, address::clamp_to_edge);
-        float3 c = hdr.sample(s, in.uv).rgb + glow.sample(s, in.uv).rgb * 0.3;
-        return float4(film(c * u.a.z), 1);
+        float d = abs((in.uv.y - 0.52) + 0.22 * (in.uv.x - 0.5));
+        float m = smoothstep(0.12, 0.5, d);
+        float3 c = mix(hdr.sample(s, in.uv).rgb, soft.sample(s, in.uv).rgb, m);
+        return float4(c * u.a.z, 1);
     }
     """
 }

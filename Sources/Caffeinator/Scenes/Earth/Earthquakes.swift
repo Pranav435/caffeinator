@@ -1,8 +1,10 @@
 import AppKit
 import Metal
+import simd
 
-/// The USGS feed of the past day's earthquakes, replayed in a minute and a half on a slowly turning globe. Each quake
-/// flares where it struck, sends out rings sized by its energy, and stays as a point coloured by depth.
+/// The USGS feed of the past day's earthquakes, replayed in a minute and a half over the real Earth. Each quake is
+/// marked like a seismicity map: a dot coloured by depth and sized by magnitude, and a hairline ring that spreads to a
+/// radius set by its energy as it strikes.
 @MainActor final class Earthquakes: Scene {
     private struct Quake {
         var lat: Double, lon: Double, depth: Double, mag: Double
@@ -37,7 +39,7 @@ import Metal
     private var view: (lat: Double, lon: Double)?
 
     var scale: Float { 1 }
-    var ready: Bool { loaded && globe.lightsSettled }
+    var ready: Bool { loaded && globe.ready }
 
     var facts: String? {
         guard loaded else { return "Loading the past day's earthquakes from the US Geological Survey." }
@@ -53,8 +55,8 @@ import Metal
         globe = try Globe.shared(gpu)
         canvas = try Globe.Canvas(gpu: gpu)
         let library = try gpu.library(Globe.metal + Self.source)
-        rings = try gpu.pipeline(library, "quakeRingFill", vertex: "quakeRing", blend: .add)
-        dots = try gpu.pipeline(library, "quakeDotFill", vertex: "quakeDot", blend: .add)
+        rings = try gpu.pipeline(library, "ribbonFill", vertex: "quakeRing", blend: .alpha)
+        dots = try gpu.pipeline(library, "quakeDotFill", vertex: "quakeDot", blend: .alpha)
         buffer = gpu.buffer(16)
         clock = Snapshot.variant.map { Float($0) * 30 } ?? 0
         fetch(gpu)
@@ -111,22 +113,23 @@ import Metal
         if f.now.timeIntervalSince(fetched) > 300 { fetch(f.gpu) }
 
         let aim = steer(f)
-        let cam = Globe.Camera(lat: Float(aim.lat), lon: Float(aim.lon), distance: 3.6, zoom: 2.75, aspect: f.aspect, sun: Globe.sun(f.now))
+        let look = Self.towardDay(aim, sun: Globe.sun(f.now), limit: 95)
+        let cam = Globe.Camera(lat: Float(look.lat), lon: Float(look.lon), distance: 3.6, zoom: 2.75, aspect: f.aspect, date: f.now)
         camera = cam
+        globe.refresh(f.now)
         let light = canvas.light(for: f)
         let view = canvas.camera(cam)
-        var style = Globe.Style()
-        style.coastColor = [0.30, 0.62, 1.0]
-        globe.draw(f.cmd, into: light, camera: view, style: style, time: f.time)
+        let style = Globe.Style()
+        globe.draw(f.cmd, into: light, camera: view, style: style, date: f.now, time: f.time)
 
         let fade = 1 - Globe.smoothstep(Self.replay + Self.hold, cycle, clock)
+        canvas.develop(f)
         let u = f.uniforms([clock, fade, f.size.y / 1000, Float(quakes.count)])
         if !quakes.isEmpty {
-            f.cmd.draw(rings, into: light, clear: false, uniforms: u, buffers: [view, buffer], vertices: 6, instances: quakes.count)
-            f.cmd.draw(dots, into: light, clear: false, uniforms: u, buffers: [view, buffer], vertices: 1, instances: quakes.count,
+            f.cmd.draw(dots, into: f.target, clear: false, uniforms: u, buffers: [view, buffer], vertices: 1, instances: quakes.count,
                        primitive: .point)
+            f.cmd.draw(rings, into: f.target, clear: false, uniforms: u, buffers: [view, buffer], vertices: 64 * 6, instances: quakes.count)
         }
-        canvas.finish(f, globe: globe, bloom: 0.7)
 
         // Quakes that popped this frame.
         var fresh: [Quake] = []
@@ -166,6 +169,18 @@ import Metal
         }
         view = (lat, lon.truncatingRemainder(dividingBy: 360))
         return view!
+    }
+
+    /// Swings a view direction toward the Sun until it's at most `limit` degrees from it, so some of the day side
+    /// is always in the picture.
+    static func towardDay(_ aim: (lat: Double, lon: Double), sun: SIMD3<Float>, limit: Float) -> (lat: Double, lon: Double) {
+        let v = Globe.geo(aim.lat, aim.lon)
+        let angle = acos(max(-1, min(1, simd_dot(v, sun))))
+        let most = limit * .pi / 180
+        guard angle > most else { return aim }
+        let axis = simd_normalize(sun - simd_dot(sun, v) * v)
+        let turn = angle - most
+        return Globe.latLon(v * cos(turn) + axis * sin(turn))
     }
 
     /// A thump for each quake as it pops, bigger lower and louder, over a rumble that swells with the energy released.
@@ -308,63 +323,40 @@ import Metal
     private static let source = """
     struct Quake { float4 where_; float4 when; };
 
+    // Display colour by depth: pale gold for shallow, through amber and rose to blue-violet for the deepest.
     float3 depthColor(float km) {
         float t = saturate(log(1 + km / 10) / log(71.0));
         float3 c0 = float3(1.0, 0.78, 0.32), c1 = float3(1.0, 0.42, 0.16), c2 = float3(0.95, 0.2, 0.48), c3 = float3(0.58, 0.3, 1.0), c4 = float3(0.3, 0.55, 1.0);
-        if (t < 0.35) return mix(c0, c1, t / 0.35);
-        if (t < 0.56) return mix(c1, c2, (t - 0.35) / 0.21);
-        if (t < 0.8) return mix(c2, c3, (t - 0.56) / 0.24);
-        return mix(c3, c4, (t - 0.8) / 0.2);
+        float3 c = t < 0.35 ? mix(c0, c1, t / 0.35) : t < 0.56 ? mix(c1, c2, (t - 0.35) / 0.21) : t < 0.8 ? mix(c2, c3, (t - 0.56) / 0.24) : mix(c3, c4, (t - 0.8) / 0.2);
+        return toSRGB(c);
     }
 
     // Ring radius in degrees: the energy, 10^(1.5 M), to the power 2/9, so each magnitude step widens it by 10^(1/3).
     inline float ringDegrees(float mag) { return clamp(0.4 * pow(10.0, (mag - 1) / 3), 0.4, 12.0); }
     inline float ringLife(float mag) { return 2.5 + max(mag, 0.0) * 0.9; }
 
-    struct Decal { float4 pos [[position]]; float2 local; float3 world; float age; float life; float3 color; float strength; };
-
+    // A hairline small circle on the surface around each quake as it strikes, 64 pieces.
     // u.a: replay clock, fade, pixel scale, count
-    vertex Decal quakeRing(uint vid [[vertex_id]], uint iid [[instance_id]], constant U &u [[buffer(0)]],
-                           constant GlobeCamera &c [[buffer(1)]], const device Quake *qs [[buffer(2)]]) {
+    vertex Ribbon quakeRing(uint vid [[vertex_id]], uint iid [[instance_id]], constant U &u [[buffer(0)]],
+                            constant GlobeCamera &c [[buffer(1)]], const device Quake *qs [[buffer(2)]]) {
         Quake q = qs[iid];
         float mag = q.where_.w;
-        float age = u.a.x - q.when.x;
-        Decal o;
-        o.age = age;
-        o.life = ringLife(mag);
-        if (age < 0 || age > o.life) { o.pos = float4(0, 0, -1, 1); return o; }
-        float2 corner = float2((vid == 1 || vid == 4 || vid == 5) ? 1 : -1, (vid == 2 || vid == 3 || vid == 5) ? 1 : -1);
+        float age = u.a.x - q.when.x, life = ringLife(mag);
+        uint seg = vid / 6, corner = vid % 6;
+        if (age < 0 || age > life || mag < 1.5) { Ribbon o; o.pos = float4(0, 0, -1, 1); o.color = 0; o.across = 0; o.half_width = 1; o.along = 0; return o; }
+        bool atB = corner == 2 || corner == 3 || corner == 5;
+        float t = age / life;
+        float rho = ringDegrees(mag) * (1 - pow(1 - t, 3.0)) * PI / 180;
         float3 n = geo(q.where_.x, q.where_.y, 1.0);
-        float3 east = normalize(float3(-n.y, n.x, 0) + float3(1e-5, 0, 0));
-        float3 north = cross(n, east);
-        float r = ringDegrees(mag) * PI / 180;
-        o.world = n + (east * corner.x + north * corner.y) * r;
-        o.pos = globeClip(o.world, c);
-        o.local = corner;
-        o.color = depthColor(q.where_.z);
-        o.strength = (0.25 + 0.75 * saturate((mag - 1) / 4.5)) * u.a.y;
-        return o;
+        float3 east = normalize(float3(-n.y, n.x, 0) + float3(1e-5, 0, 0)), north = cross(n, east);
+        float a0 = float(seg) / 64 * TAU, a1 = float(seg + 1) / 64 * TAU;
+        float3 p0 = (n * cos(rho) + (east * cos(a0) + north * sin(a0)) * sin(rho)) * 1.001;
+        float3 p1 = (n * cos(rho) + (east * cos(a1) + north * sin(a1)) * sin(rho)) * 1.001;
+        float a = pow(1 - t, 1.6) * (0.3 + 0.6 * saturate((mag - 1.5) / 4)) * u.a.y * globeFacing(atB ? p1 : p0, c);
+        return ribbon(corner, globeClip(p0, c), globeClip(p1, c), 1.1 * u.a.z, float4(depthColor(q.where_.z), 1) * a, u.res);
     }
 
-    fragment float4 quakeRingFill(Decal in [[stage_in]], constant GlobeCamera &c [[buffer(1)]]) {
-        float d = length(in.local);
-        float fw = max(fwidth(d), 1e-4);
-        float x = in.age / in.life;
-        float light = 0;
-        for (int k = 0; k < 3; k++) {
-            float t = saturate((in.age - float(k) * 0.45) / (in.life - 0.9));
-            if (t <= 0 || t >= 1) continue;
-            float r = 1 - (1 - t) * (1 - t);
-            float w = fw * 1.3;
-            light += exp(-pow((d - r) / w, 2.0)) * pow(1 - t, 1.6) * (1 - float(k) * 0.25);
-        }
-        // A brief glow over the struck area as the first ring leaves.
-        light += exp(-d * d * 18) * exp(-in.age * 2.5) * 0.6;
-        float shown = globeFacing(normalize(in.world), c) * smoothstep(1.0, 0.94, d);
-        return float4(in.color * light * in.strength * shown * 1.6 * (1 - x * 0.3), 0);
-    }
-
-    struct Dot { float4 pos [[position]]; float size [[point_size]]; float3 color; float flash; };
+    struct Dot { float4 pos [[position]]; float size [[point_size]]; float3 color; float alpha; };
 
     vertex Dot quakeDot(uint iid [[instance_id]], constant U &u [[buffer(0)]], constant GlobeCamera &c [[buffer(1)]],
                         const device Quake *qs [[buffer(2)]]) {
@@ -377,18 +369,19 @@ import Metal
         float shown = globeFacing(p, c);
         if (age < 0 || shown <= 0) { o.pos = float4(0, 0, -1, 1); o.size = 0; return o; }
         float m = clamp(mag, 0.0, 8.0);
-        o.size = (5 + m * 3.2 + 14 * exp(-age * 1.5) * saturate(m / 4)) * u.a.z;
-        o.flash = exp(-age * 1.2);
-        o.color = depthColor(q.where_.z) * (0.45 + 0.11 * m) * shown * u.a.y;
+        o.size = (4 + m * 1.5 + 5 * exp(-age * 2.5) * saturate(m / 3)) * u.a.z;
+        o.color = depthColor(q.where_.z);
+        o.alpha = shown * u.a.y * (0.6 + 0.4 * exp(-age / 30));
         return o;
     }
 
+    // A crisp dot with a thin dark rim, so it reads over cloud as well as sea.
     fragment float4 quakeDotFill(Dot in [[stage_in]], float2 pc [[point_coord]]) {
         float d = length(pc - 0.5) * 2;
-        float core = smoothstep(0.3, 0.14, d);
-        float halo = exp(-d * d * 9) * 0.4;
-        float3 c = in.color * (core * (1 + in.flash * 1.5) + halo * (0.5 + in.flash));
-        return float4(c + core * in.flash * 0.3, 0);
+        float px = max(fwidth(d), 1e-3);
+        float core = 1 - smoothstep(0.5 - px, 0.5 + px, d);
+        float rim = (1 - smoothstep(0.78 - px, 0.78 + px, d)) - core;
+        return (float4(in.color, 1) * core + float4(0, 0, 0, 0.45) * rim) * in.alpha;
     }
     """
 }

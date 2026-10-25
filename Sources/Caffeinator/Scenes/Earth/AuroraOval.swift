@@ -42,8 +42,8 @@ import simd
     private let start: Float
     private var sparkle: Float = 0
 
-    var scale: Float { 1 }
-    var ready: Bool { loaded && globe.lightsSettled }
+    var scale: Float { 0.7 }
+    var ready: Bool { loaded && globe.ready }
 
     var facts: String? {
         guard loaded else { return "Loading NOAA's aurora forecast." }
@@ -77,8 +77,8 @@ import simd
         structure = gpu.texture(4096, 8)
         march = try gpu.pipeline(library, "auroraMarch")
         add = try gpu.pipeline(library, "auroraAdd", blend: .add)
-        lines = try gpu.pipeline(library, "dashedFill", vertex: "surfaceLine", blend: .add)
-        marks = try gpu.pipeline(library, "youFill", vertex: "youMark", blend: .add)
+        lines = try gpu.pipeline(library, "dashedFill", vertex: "surfaceLine", blend: .alpha)
+        marks = try gpu.pipeline(library, "youFill", vertex: "youMark", blend: .alpha)
         maps = (0..<2).map { _ in gpu.texture(Self.mapSize, Self.mapSize, .r16Float) }
         var zero: UInt8 = 0
         ovation = gpu.texture(1, 1, .r8Unorm, bytes: &zero, bytesPerRow: 1)
@@ -222,44 +222,24 @@ import simd
             : simd_normalize(north * sin((1 - swing) * angle) + south * sin(swing * angle))
         if !dir.x.isFinite { dir = north }
         let spot = Globe.latLon(dir)
-        let cam = Globe.Camera(lat: Float(spot.lat), lon: Float(spot.lon), distance: 2.05, zoom: 1.7, aspect: f.aspect, sun: sun)
+        let cam = Globe.Camera(lat: Float(spot.lat), lon: Float(spot.lon), distance: 2.05, zoom: 1.7, aspect: f.aspect, date: f.now)
         camera = cam
 
         let light = canvas.light(for: f)
         let view = canvas.camera(cam)
         var style = Globe.Style()
-        style.coastColor = [0.28, 0.5, 0.95]
-        style.coast = 0.8
-        style.spacing = 10
         style.lights = 1.2
-        globe.draw(f.cmd, into: light, camera: view, style: style, time: f.time)
-
-        // Lines on the surface: the view line (10 percent) in each hemisphere, then your latitude.
-        let lat = Location.shared.latitude
-        if circle == nil || abs(lat - circleLat) > 0.01 {
-            circleLat = lat
-            circle = f.gpu.buffer((0...360).map { SIMD4(Globe.geo(lat, Double($0), 1.0008), Float($0)) })
-        }
-        let px = f.size.y / 1000
-        for (_, buffer) in viewLines {
-            f.cmd.draw(lines, into: light, clear: false, uniforms: f.uniforms([px, 1.3, 0, 0.32], [1.0, 0.25, 0.55, 0], SIMD4(sun, 1)),
-                       buffers: [view, buffer],
-                       vertices: (buffer.length / 16 - 1) * 6)
-        }
-        if let circle {
-            f.cmd.draw(lines, into: light, clear: false, uniforms: f.uniforms([px, 1.2, 2, 0.3], [1.0, 0.7, 0.4, 0]), buffers: [view, circle],
-                       vertices: 360 * 6)
-        }
-        let me = SIMD4(Globe.geo(lat, Location.shared.longitude, 1.001), 0)
-        f.cmd.draw(marks, into: light, clear: false, uniforms: f.uniforms([px, 0, 0, 0]), buffers: [view, canvas.stream(0, [me])], vertices: 1,
-                   primitive: .point)
+        style.moonlight = 0.02
+        style.nightGlow = 0.006
+        globe.refresh(f.now)
+        globe.draw(f.cmd, into: light, camera: view, style: style, date: f.now, time: f.time)
 
         // The aurora: polar maps of the forecast with arcs and rays, then a half-resolution march through the sky.
         if !grid.isEmpty {
             let red = Float(0.35 + min(kp ?? 2, 9) / 9 * 0.9)
-            f.cmd.compute(structureKernel, 4096, 8, uniforms: f.uniforms([t, 0, 0, 0]), textures: [structure])
+            f.cmd.compute(structureKernel, 4096, 4, uniforms: f.uniforms([t, 0, 0, 0]), textures: [structure])
             for (i, h) in [Float(1), -1].enumerated() where i == 0 ? hemisphere > -0.7 : hemisphere < 0.7 {
-                f.cmd.compute(mapKernel, Self.mapSize, Self.mapSize, uniforms: f.uniforms([t, h, 0, 0], .zero, SIMD4(Self.dipole, 0)),
+                f.cmd.compute(mapKernel, Self.mapSize, Self.mapSize, uniforms: f.uniforms([t, h, 0, 0], SIMD4(sun, 0), SIMD4(Self.dipole, 0)),
                               textures: [ovation, structure, maps[i]])
             }
             let w = max(f.target.width / 2, 1), h = max(f.target.height / 2, 1)
@@ -268,7 +248,22 @@ import simd
                        textures: maps, buffers: [view])
             f.cmd.draw(add, into: light, clear: false, uniforms: f.uniforms(), textures: [glow!])
         }
-        canvas.finish(f, globe: globe, bloom: 0.8)
+        canvas.develop(f, Self.look)
+
+        // Over the picture, hairlines on the surface: the view line (10 percent) in each hemisphere, then your latitude.
+        let lat = Location.shared.latitude
+        if circle == nil || abs(lat - circleLat) > 0.01 {
+            circleLat = lat
+            circle = f.gpu.buffer((0...360).map { SIMD4(Globe.geo(lat, Double($0), 1.0008), Float($0)) })
+        }
+        let px = f.size.y / 1000
+        if let circle {
+            f.cmd.draw(lines, into: f.target, clear: false, uniforms: f.uniforms([px, 1.0, 2, 0.45], [1.0, 0.8, 0.6, 0]),
+                       buffers: [view, circle], vertices: 360 * 6)
+        }
+        let me = SIMD4(Globe.geo(lat, Location.shared.longitude, 1.001), 0)
+        f.cmd.draw(marks, into: f.target, clear: false, uniforms: f.uniforms([px, 0, 0, 0]), buffers: [view, canvas.stream(0, [me])], vertices: 1,
+                   primitive: .point)
 
         if let synth = f.sound { play(synth, f) }
         if f.time - lastOverlay >= 0.1 || f.index == 0 {
@@ -303,8 +298,6 @@ import simd
     private func drawOverlay(_ f: Frame) {
         guard let cam = camera else { return }
         let drift = CGPoint(x: CGFloat(sin(f.time * 0.007)) * 6, y: CGFloat(cos(f.time * 0.009)) * 4)
-        let h: Double = hemisphere >= 0 ? 1 : -1
-        let line = viewLatitude(h)
         f.overlay.draw { ctx, size in
             let dim = NSColor(white: 1, alpha: 0.42), faint = NSColor(white: 1, alpha: 0.24)
             let left = 44 + drift.x, top = 38 + drift.y
@@ -323,10 +316,6 @@ import simd
                     ctx.fill(CGRect(x: gx + CGFloat(i) * 9, y: gy, width: 6, height: 3))
                 }
             }
-            if let line {
-                ctx.text("VIEW LINE  \(Int(abs(line).rounded()))° \(h > 0 ? "N" : "S")", at: CGPoint(x: left, y: top + 84), size: 10,
-                         weight: .semibold, color: NSColor(srgbRed: 1, green: 0.5, blue: 0.75, alpha: 0.55), tracking: 1.2)
-            }
             // You.
             let lat = Location.shared.latitude, lon = Location.shared.longitude
             if let p = cam.overlay(Globe.geo(lat, lon, 1.001), size), cam.facing(Globe.geo(lat, lon)) > 0.5 {
@@ -336,6 +325,9 @@ import simd
             }
         }
     }
+
+    /// Exposed for the night side, where the aurora and the cities are.
+    private static let look = Lens.Look(exposure: 2.2, bloom: 0.04, halation: 0.015, vignette: 0.3, aberration: 0.8, grain: 0.45)
 
     private static let source = """
     constant float MAXCOLAT = 50.0 * PI / 180;
@@ -348,23 +340,32 @@ import simd
     }
 
     // The aurora's structure depends only on magnetic longitude and time, so it's computed once a frame along a ring:
-    // x is magnetic longitude, y one of eight arc slots. r: how far arcs are pushed in latitude (folds and curls),
-    // g: whether this slot's arc is lit here, b: vertical rays, a: broad bright patches.
+    // x is magnetic longitude, y one of four discrete arcs. r: how far the arc is pushed across the oval, in km (folds
+    // and curls), g: how bright it is here (arcs break up and fade along their length), b: its rays, a: broad surges.
     kernel void auroraStructure(constant U &u [[buffer(0)]], texture2d<float, access::write> out [[texture(0)]],
                                 uint2 gid [[thread_position_in_grid]]) {
         float mlon = (float(gid.x) + 0.5) / out.get_width() * TAU - PI;
         float2 ring = float2(cos(mlon), sin(mlon));
         float t = u.a.x, k = float(gid.y);
-        float wiggle = (fbm(float3(ring * 2.5, t * 0.01), 3) - 0.5) * 5 + sin(mlon * 4 + t * 0.017) * 0.6
-                     + (fbm(float3(ring * 14, t * 0.02 + 3), 3) - 0.5) * 1.2;
-        float stretch = smoothstep(0.42, 0.75, noise(float3(ring * 3 + k * 7.3, t * 0.008 + k)));
-        float rays = (0.45 + 0.55 * noise(float3(ring * 80, t * 0.05))) * (0.7 + 0.3 * noise(float3(ring * 260, t * 0.08)));
-        float patches = 0.5 + 0.8 * fbm(float3(ring * 5, t * 0.017 + 7), 3);
-        out.write(float4(wiggle, stretch, rays, patches), gid);
+        float fold = (fbm(float3(ring * 2.2 + k * 3.1, t * 0.008 + k), 3) - 0.5) * 220 + sin(mlon * 3 + t * 0.013 + k * 2) * 35
+                   + (fbm(float3(ring * 16 + k, t * 0.02 + 3), 3) - 0.5) * 50;
+        float lit = smoothstep(0.38, 0.7, fbm(float3(ring * 2.6 + k * 7.3, t * 0.006 + k * 1.7), 3));
+        lit *= 0.5 + 0.5 * noise(float3(ring * 9 + k * 4.1, t * 0.012));
+        float rays = (0.4 + 0.6 * noise(float3(ring * 90 + k * 13, t * 0.04))) * (0.7 + 0.3 * noise(float3(ring * 300, t * 0.07)));
+        float surge = 0.6 + 0.8 * fbm(float3(ring * 4, t * 0.015 + 7), 3);
+        out.write(float4(fold, lit, rays, surge), gid);
     }
 
-    // u.a: time, hemisphere   u.c: dipole axis. How much aurora each point of a polar map shows: the forecast
-    // probability, as a faint diffuse glow plus a few discrete arcs along magnetic latitude.
+    // The forecast in percent at a unit vector.
+    inline float chance(texture2d<float> ovation, float3 n) {
+        constexpr sampler s(filter::linear, s_address::repeat, t_address::clamp_to_edge);
+        float lat = asin(clamp(n.z, -1.0, 1.0)) * 180 / PI, lon = atan2(n.y, n.x) * 180 / PI;
+        return ovation.sample(s, float2(fract((lon + 360.5) / 360), (90.5 - lat) / 181)).r * 255;
+    }
+
+    // u.a: time, hemisphere   u.b: sun   u.c: dipole axis. How much aurora each point of a polar map shows: a faint
+    // diffuse glow where the forecast puts it, and discrete arcs along contours of the forecast (10, 22, 36 and 52
+    // percent), so a quiet night has one thin arc and a storm several, folded and broken like real ones.
     kernel void auroraMap(constant U &u [[buffer(0)]], texture2d<float> ovation [[texture(0)]], texture2d<float> structure [[texture(1)]],
                           texture2d<float, access::write> map [[texture(2)]], uint2 gid [[thread_position_in_grid]]) {
         float2 p = (float2(gid) + 0.5) / float2(map.get_width(), map.get_height()) * 2 - 1;
@@ -375,22 +376,31 @@ import simd
         float colat = rr * MAXCOLAT;
         float2 d = p / max(rr, 1e-6);
         float3 n = float3(sin(colat) * d.x, sin(colat) * d.y, h * cos(colat));
-        float lat = asin(n.z) * 180 / PI, lon = atan2(n.y, n.x) * 180 / PI;
-        constexpr sampler s(filter::linear, s_address::repeat, t_address::clamp_to_edge);
-        float v = ovation.sample(s, float2(fract((lon + 360.5) / 360), (90.5 - lat) / 181)).r * 255;
-        float strength = (v / 18) / (1 + v / 80);
+        float v = chance(ovation, n);
+        float diffuse = (v / 18) / (1 + v / 80);
+
+        // The forecast's slope in percent per km, from neighbours 60 km away.
+        float3 east = normalize(cross(float3(0, 0, 1), n) + float3(1e-6, 0, 0)), north = cross(n, east);
+        const float reach = 60.0 / 6371;
+        float2 grad = float2(chance(ovation, normalize(n + east * reach)) - chance(ovation, normalize(n - east * reach)),
+                             chance(ovation, normalize(n + north * reach)) - chance(ovation, normalize(n - north * reach))) / 120;
+        float slope = max(length(grad), 0.03);
 
         float3 axis = u.c.xyz * h;
-        float mlat = asin(clamp(dot(n, axis), -1.0, 1.0)) * 180 / PI;
         float3 e1 = normalize(cross(float3(0, 0, 1), axis)), e2 = cross(axis, e1);
         float x = atan2(dot(n, e2), dot(n, e1)) / TAU + 0.5;
-        float4 st = structure.sample(s, float2(x, 0.5 / 8));
-        float w = (mlat + st.r) / 3.2 + u.a.x * 0.004;
-        float k = floor(w), f = fract(w);
-        float slot = k - 8 * floor(k / 8);
-        float stretch = structure.sample(s, float2(x, (slot + 0.5) / 8)).g;
-        float arc = exp(-pow((f - 0.5) / 0.07, 2.0)) + 0.35 * exp(-pow((f - 0.5) / 0.2, 2.0)) * step(f, 0.5);
-        map.write(float4(strength * (0.1 * st.a + 1.3 * arc * stretch * st.b * st.a)), gid);
+        constexpr sampler s(filter::linear, s_address::repeat, t_address::clamp_to_edge);
+        float night = smoothstep(0.35, -0.15, dot(n, u.b.xyz));
+        const float levels[4] = { 10, 22, 36, 52 };
+        float arcs = 0;
+        for (int k = 0; k < 4; k++) {
+            float4 st = structure.sample(s, float2(x, (float(k) + 0.5) / 8));
+            float km = (v - levels[k]) / slope + st.r;
+            // A sharp lower edge and a softer glow above it, as in real arcs.
+            float arc = 0.75 * exp(-pow(km / 26, 2.0)) + 0.35 * exp(-pow(km / 90, 2.0)) * smoothstep(-30.0, 40.0, km);
+            arcs += arc * st.g * st.b * st.a * (1 - 0.15 * float(k));
+        }
+        map.write(float4(diffuse * 0.06 + arcs * saturate(v / 8) * mix(0.25, 1.0, night)), gid);
     }
 
     // u.a: time, -, -, red weight   u.b: sun
@@ -423,12 +433,14 @@ import simd
             float red = smoothstep(150.0, 230.0, km) * exp(-max(km - 230, 0.0) / 110);
             float violet = exp(-pow((km - 95) / 7, 2.0));
             float lit = smoothstep(-0.12, 0.06, dot(n, u.b.xyz));
-            float3 e = float3(0.12, 1.0, 0.42) * green + float3(1.0, 0.16, 0.24) * red * u.a.w * 0.3 + float3(0.55, 0.3, 1.0) * violet * 0.2;
+            float3 e = float3(0.22, 0.95, 0.5) * green + float3(0.9, 0.2, 0.3) * red * u.a.w * 0.4 + float3(0.55, 0.3, 1.0) * violet * 0.2;
             col += e * a * mix(1.0, 0.25, lit) * dt * 6371;
         }
         // Long grazing paths near the limb pile up light; compress them gently so the green keeps its hue.
-        col *= 0.012;
-        return float4(col / (1 + max(col.g, col.r) * 0.7), 0);
+        col *= 0.007;
+        col = col / (1 + max(col.g, col.r) * 0.9);
+        col = mix(float3(dot(col, float3(0.3, 0.6, 0.1))), col, 0.72);
+        return float4(col, 0);
     }
 
     fragment float4 auroraAdd(V in [[stage_in]], texture2d<float> glow [[texture(0)]]) {
@@ -436,7 +448,7 @@ import simd
         return float4(glow.sample(s, in.uv).rgb, 0);
     }
 
-    // u.a: pixel scale, width, dash period in degrees (0 for solid), level   u.b: colour   u.c: sun, and 1 to show only by night
+    // u.a: pixel scale, width, dash period in degrees (0 for solid), opacity   u.b: display colour   u.c: sun, and 1 to show only by night
     vertex Ribbon surfaceLine(uint vid [[vertex_id]], constant U &u [[buffer(0)]], constant GlobeCamera &c [[buffer(1)]],
                               const device float4 *pts [[buffer(2)]]) {
         uint seg = vid / 6, corner = vid % 6;
@@ -446,15 +458,15 @@ import simd
         // A zero point marks a break between pieces.
         float gap = (length(a.xyz) < 0.5 || length(b.xyz) < 0.5) ? 0 : 1;
         float night = u.c.w > 0 ? smoothstep(0.15, -0.25, dot(normalize(q), u.c.xyz)) : 1;
-        float4 color = float4(u.b.rgb * u.a.w * globeFacing(q, c) * gap * night, 0);
-        Ribbon o = ribbon(corner, globeClip(a.xyz, c), globeClip(b.xyz, c), u.a.y * u.a.x, color, u.res);
+        float alpha = u.a.w * globeFacing(q, c) * gap * night;
+        Ribbon o = ribbon(corner, globeClip(a.xyz, c), globeClip(b.xyz, c), u.a.y * u.a.x, float4(u.b.rgb, 1) * alpha, u.res);
         o.along = atB ? b.w : a.w;
         if (gap == 0) o.pos = float4(0, 0, -1, 1);
         return o;
     }
 
     fragment float4 dashedFill(Ribbon in [[stage_in]], constant U &u [[buffer(0)]]) {
-        float dash = u.a.z > 0 ? smoothstep(0.35, 0.45, fract(in.along / u.a.z)) * smoothstep(1.0, 0.9, fract(in.along / u.a.z)) : 1;
+        float dash = u.a.z > 0 ? step(0.5, fract(in.along / u.a.z)) : 1;
         return in.color * saturate(in.half_width + 0.5 - abs(in.across)) * dash;
     }
 
@@ -465,15 +477,18 @@ import simd
         You o;
         o.pos = globeClip(marks[i].xyz, c);
         o.shown = globeFacing(marks[i].xyz, c);
-        o.size = 18 * u.a.x;
+        o.size = 22 * u.a.x;
         return o;
     }
 
+    // A small crosshair: a ring with four ticks.
     fragment float4 youFill(You in [[stage_in]], float2 pc [[point_coord]]) {
-        float d = length(pc - 0.5) * 2;
-        float ring = saturate(1 - abs(d - 0.75) / max(fwidth(d) * 1.2, 1e-3));
-        float core = smoothstep(0.2, 0.06, d);
-        return float4(float3(1.0, 0.62, 0.3) * (core + ring * 0.5) * in.shown, 0);
+        float2 p = (pc - 0.5) * 2, a = abs(p);
+        float px = max(fwidth(p.x), 1e-3) * 1.1;
+        float ring = 1 - smoothstep(0.0, px, abs(length(p) - 0.42));
+        float ticks = (1 - smoothstep(0.0, px, a.x)) * step(0.55, a.y) * step(a.y, 0.95)
+                    + (1 - smoothstep(0.0, px, a.y)) * step(0.55, a.x) * step(a.x, 0.95);
+        return float4(1.0, 0.8, 0.6, 1) * saturate(ring + ticks) * 0.85 * in.shown;
     }
     """
 }

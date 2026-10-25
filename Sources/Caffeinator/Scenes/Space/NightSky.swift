@@ -14,6 +14,8 @@ import simd
         var sun: SIMD4<Float>
         var moon: SIMD4<Float>
         var glow: SIMD4<Float>
+        /// Photograph loaded (0 or 1), azimuth and strength of the nearest town's glow, unused.
+        var extra: SIMD4<Float>
     }
 
     private struct Body { var dir: SIMD4<Float>; var color: SIMD4<Float>; var extra: SIMD4<Float> }
@@ -39,12 +41,16 @@ import simd
     private let labelPipe: MTLRenderPipelineState
     private let groundLabelPipe: MTLRenderPipelineState
     private let bloom: Bloom
-    private let milkyWay: MTLTexture
+    private let outline: MTLTexture
+    private let blank: MTLTexture
+    private let lens: Lens
+    private var photo: MTLTexture?
+    private var moonMap: MTLTexture?
+    private var loading = true
+    private var hdr: MTLTexture?
     private let stars: MTLBuffer
-    private let dust: MTLBuffer
     private let segments: MTLBuffer
     private let starCount: Int
-    private let dustCount: Int
     private let segmentCount: Int
     private let rings: [Ring]
     private var light: MTLTexture?
@@ -62,10 +68,14 @@ import simd
     private var lastBell: Float = -10
 
     var scale: Float { 1 }
+    var ready: Bool { !loading }
+    var credit: String? {
+        (photo == nil ? "" : MilkyWay.credit) + (moonMap == nil ? "" : (photo == nil ? "" : "; ") + "Moon: NASA SVS / LRO (CGI Moon Kit)")
+    }
     var facts: String? { summary.isEmpty ? nil : summary }
 
     init(gpu: GPU) throws {
-        let library = try gpu.library(SpaceKit.metal + Self.source)
+        let library = try gpu.library(SpaceKit.metal + SpaceSky.metal + Self.source)
         back = try gpu.pipeline(library, "skyBack")
         starPipe = try gpu.pipeline(library, "glowFragment", vertex: "starVertex", blend: .add)
         linePipe = try gpu.pipeline(library, "lineFragment", vertex: "figureVertex", blend: .add)
@@ -76,12 +86,15 @@ import simd
         labelPipe = try gpu.pipeline(library, "skyLabelFragment", vertex: "labelVertex", blend: .alpha)
         groundLabelPipe = try gpu.pipeline(library, "labelFragment", vertex: "labelVertex", blend: .alpha)
         bloom = try Bloom(gpu: gpu)
+        lens = try Lens(gpu: gpu)
         rings = (0..<6).map { _ in Ring(gpu: gpu, bytes: 4096) }
         // `--variant n` shows the sky n hours from now, for checking night and day in snapshots.
         offset = Double(Snapshot.variant ?? 0) * 3600
 
         var levels = SkyCatalog.milkyWay.map { $0 * 51 }
-        milkyWay = levels.withUnsafeMutableBytes { gpu.texture(720, 360, .r8Unorm, bytes: $0.baseAddress!, bytesPerRow: 720) }
+        outline = levels.withUnsafeMutableBytes { gpu.texture(720, 360, .r8Unorm, bytes: $0.baseAddress!, bytesPerRow: 720) }
+        var grey: [UInt8] = [128, 128, 128, 255]
+        blank = grey.withUnsafeMutableBytes { gpu.texture(1, 1, .rgba8Unorm, bytes: $0.baseAddress!, bytesPerRow: 4) }
 
         // Stars: equatorial unit vector and magnitude, then colour and a twinkle seed.
         let catalogue = SkyCatalog.stars.flatMap { s -> [SIMD4<Float>] in
@@ -91,26 +104,6 @@ import simd
         }
         starCount = catalogue.count / 2
         stars = gpu.buffer(catalogue)
-
-        // Unresolved stars too faint for the catalogue, scattered where the Milky Way outline says the sky is rich.
-        var faint: [SIMD4<Float>] = []
-        var tries = 0
-        while faint.count < 2 * 24000, tries < 400_000 {
-            tries += 1
-            let z = Double.random(in: -1...1), phi = Double.random(in: 0..<2 * .pi)
-            let g = SIMD3(sqrt(1 - z * z) * cos(phi), sqrt(1 - z * z) * sin(phi), z)
-            let l = Astro.norm(Astro.deg(atan2(g.y, g.x))), b = Astro.deg(asin(z))
-            let cell = min(Int((b + 90) * 2), 359) * 720 + min(Int(l * 2), 719)
-            let rich = Double(SkyCatalog.milkyWay[cell]) / 5
-            guard Double.random(in: 0..<1) < 0.05 + 0.95 * pow(rich, 0.7) else { continue }
-            let rows = SkyCatalog.galactic
-            let e = rows[0] * g.x + rows[1] * g.y + rows[2] * g.z
-            let mag = Float(6.3 + 2.6 * pow(Double.random(in: 0..<1), 0.6))
-            let c = Self.tint(SkyCatalog.blackbody(SkyCatalog.temperature(bv: .random(in: -0.1...1.4))))
-            faint += [SIMD4(Float(e.x), Float(e.y), Float(e.z), mag), SIMD4(c, .random(in: 0..<1))]
-        }
-        dustCount = faint.count / 2
-        dust = gpu.buffer(faint)
 
         // Constellation figures, cut into short pieces so they curve with the projection, with a gap at each star.
         var pieces: [SIMD4<Float>] = []
@@ -132,6 +125,11 @@ import simd
         segmentCount = pieces.count / 2
         segments = gpu.buffer(pieces)
         Location.shared.request()
+        Task { @MainActor [weak self] in
+            self?.photo = await MilkyWay.texture(gpu)
+            self?.moonMap = await Imagery.texture(Self.moonURL, gpu, maxSize: 1024, maxAge: 365 * 86400)
+            self?.loading = false
+        }
     }
 
     private static func slerp(_ p: SIMD3<Double>, _ q: SIMD3<Double>, _ t: Double, _ angle: Double) -> SIMD3<Double> {
@@ -147,6 +145,9 @@ import simd
     }
 
     // MARK: Sky geometry
+
+    /// NASA's CGI Moon Kit colour map from the Lunar Reconnaissance Orbiter, public domain (svs.gsfc.nasa.gov/4720).
+    private static let moonURL = URL(string: "https://svs.gsfc.nasa.gov/vis/a000000/a004700/a004720/lroc_color_poles_1k.jpg")!
 
     private struct View {
         var eq: [SIMD3<Double>]     // equatorial → horizon (east, north, up)
@@ -204,6 +205,7 @@ import simd
         if light?.width != f.target.width || light?.height != f.target.height {
             light = f.gpu.texture(f.target.width, f.target.height)
             backdrop = f.gpu.texture(f.target.width / 2, f.target.height / 2)
+            hdr = f.gpu.texture(f.target.width, f.target.height)
             labels = makeLabels(f)
         }
 
@@ -220,19 +222,21 @@ import simd
         let density = Float(f.size.y / 1000)
 
         let f4 = { (d: SIMD3<Double>, w: Double) in SIMD4(Float(d.x), Float(d.y), Float(d.z), Float(w)) }
+        let twilight = Float(min(max((sunAlt + 18) / 18, 0), 1))
+        let glow = SIMD4<Float>(Float(moonUp), twilight, f.seed, density)
+        let town = Float(f.seed * 7.31).truncatingRemainder(dividingBy: 1) * 2 * Float.pi
+        let extra = SIMD4<Float>(photo == nil ? 0 : 1, town, 1, 0)
         let u = SkyU(eq0: f4(v.eq[0], 0), eq1: f4(v.eq[1], 0), eq2: f4(v.eq[2], 0),
                      cam0: f4(v.cam[0], 0), cam1: f4(v.cam[1], 0), cam2: f4(v.cam[2], 0),
                      view: SIMD4(Float(v.scale), f.aspect, f.size.y / 2, f.time.truncatingRemainder(dividingBy: 1000)),
                      sun: f4(sun, sunAlt), moon: f4(moon, phase.lit),
-                     glow: SIMD4(Float(moonUp), Float(min(max((sunAlt + 18) / 18, 0), 1)), f.seed, density))
+                     glow: glow, extra: extra)
         let skyBuffer = rings[0].next(u)
         let light = light!
         let uni = f.uniforms()
 
-        f.cmd.draw(back, into: backdrop!, uniforms: uni, textures: [milkyWay], buffers: [skyBuffer])
-        f.cmd.draw(starPipe, into: light, uniforms: f.uniforms([0.55, 0, 0, 0]), buffers: [skyBuffer, dust],
-                   vertices: 4, instances: dustCount, primitive: .triangleStrip)
-        f.cmd.draw(linePipe, into: light, clear: false, uniforms: uni, buffers: [skyBuffer, segments],
+        f.cmd.draw(back, into: backdrop!, uniforms: uni, textures: [photo ?? outline, outline], buffers: [skyBuffer])
+        f.cmd.draw(linePipe, into: light, uniforms: uni, buffers: [skyBuffer, segments],
                    vertices: 4, instances: segmentCount, primitive: .triangleStrip)
         f.cmd.draw(starPipe, into: light, clear: false, uniforms: f.uniforms([1, 0, 0, 0]), buffers: [skyBuffer, stars],
                    vertices: 4, instances: starCount, primitive: .triangleStrip)
@@ -254,7 +258,7 @@ import simd
         if sun.z > -0.05 {
             discs.append(Body(dir: f4(sun, 2), color: SIMD4(1.0, 0.8, 0.55, 1), extra: .zero))
         }
-        f.cmd.draw(discPipe, into: light, clear: false, uniforms: uni, buffers: [skyBuffer, rings[2].next(discs)],
+        f.cmd.draw(discPipe, into: light, clear: false, uniforms: uni, textures: [moonMap ?? blank], buffers: [skyBuffer, rings[2].next(discs)],
                    vertices: 4, instances: discs.count, primitive: .triangleStrip)
 
         updateMeteors(f, date, v)
@@ -266,8 +270,9 @@ import simd
         f.cmd.draw(meteorPipe, into: light, clear: false, uniforms: uni, buffers: [skyBuffer, rings[3].next(streaks)],
                    vertices: 4, instances: meteors.count, primitive: .triangleStrip)
 
-        let glow = bloom.glow(f.cmd, light)
-        f.cmd.draw(finish, into: f.target, uniforms: uni, textures: [light, glow, backdrop!], buffers: [skyBuffer])
+        let halo = bloom.glow(f.cmd, light)
+        f.cmd.draw(finish, into: hdr!, uniforms: uni, textures: [light, halo, backdrop!], buffers: [skyBuffer])
+        lens.develop(f, hdr!, Lens.Look(exposure: 1.9, white: [1, 1, 1], bloom: 0, halation: 0.012, vignette: 0.28, aberration: 1.0, grain: 0.55))
 
         if let labels {
             let (sky, ground) = labelQuads(labels, v, date, density)
@@ -519,6 +524,7 @@ import simd
         float4 sun;       // horizon direction, altitude in degrees
         float4 moon;      // horizon direction, lit fraction
         float4 glow;      // moonlight, twilight 0...1, seed, pixel density
+        float4 extra;     // photograph loaded, azimuth of a town's glow, its strength
     };
 
     constant float3x3 GALACTIC = float3x3(float3(-0.0548755604, 0.4941094279, -0.8676661490),
@@ -544,70 +550,80 @@ import simd
         return cols(k.cam, unstereo(p, k.view.x));
     }
 
-    // Altitude of the distant hills and treeline, in degrees, at an azimuth.
-    inline float ridge(float az, float seed) {
+    // Starlight's passage through the air: airmass X toward an altitude whose sine is `s` (Kasten and Young, flattened
+    // at the horizon), and the share of each colour that gets through, blue scattered away fastest.
+    inline float airmassOf(float s) { float a = max(s, 0.0); return min(1.0 / (a + 0.025 * exp(-11.0 * a)), 38.0); }
+    inline float3 extinction(float X) { return pow(float3(10.0), -0.4 * float3(0.14, 0.2, 0.34) * (X - 1)); }
+
+    // Altitude in degrees of three ranks of land at an azimuth: far mountains, rolling hills, a ragged treeline.
+    inline float3 ridges(float az, float seed) {
         float2 c = float2(cos(az), sin(az));
-        float hills = 0.4 + 2.3 * smoothstep(0.3, 0.75, fbm(c * 1.7 + seed, 4));
-        float forest = smoothstep(0.45, 0.6, noise(c * 3.0 + seed * 1.7 + 9.0));
-        float trees = forest * (0.45 + 0.9 * fbm(c * 70.0 + seed, 3)) * (0.6 + 0.6 * noise(c * 230.0));
-        return hills + trees;
+        float mountains = 0.6 + 5.2 * smoothstep(0.32, 0.82, fbm(c * 2.0 + seed * 1.3, 5)) * (0.75 + 0.5 * noise(c * 23.0 + seed));
+        mountains += (fbm(c * 70.0 + seed, 4) - 0.5) * 0.9 + (noise(c * 260.0) - 0.5) * 0.12;
+        float hills = 0.3 + 2.6 * smoothstep(0.28, 0.78, fbm(c * 1.6 + seed + 4.0, 4));
+        hills += (fbm(c * 45.0 + seed * 2.0, 4) - 0.5) * 0.55 + (noise(c * 200.0) - 0.5) * 0.1;
+        float forest = smoothstep(0.42, 0.58, noise(c * 3.0 + seed * 1.7 + 9.0));
+        float x = az * 95.0 + noise(c * 41.0 + seed) * 4.0;
+        float spike = pow(1.0 - abs(fract(x) * 2.0 - 1.0), 1.6);
+        float trees = forest * (0.35 + 0.8 * fbm(c * 60.0 + seed, 3)) * (0.35 + 0.65 * spike) * (0.6 + 0.6 * noise(c * 230.0));
+        return float3(mountains, hills, 0.15 + 0.55 * hills + trees);
     }
 
-    // How much of a pixel is ground, antialiased over about a pixel.
-    inline float groundCover(float3 h, constant Sky &k, float2 res) {
+    // How much of a pixel each rank of land covers, antialiased over about a pixel.
+    inline float3 landCover(float3 h, constant Sky &k, float2 res) {
         float alt = asin(clamp(h.z, -1.0, 1.0)) * 57.29578;
-        if (alt > 4.6) return 0;    // above the highest treetop
-        if (alt < 0) return 1;      // below the lowest hill
-        float az = atan2(h.x, h.y);
+        if (alt > 7.4) return 0;
+        if (alt < -0.1) return 1;
         float perDegree = k.view.x * k.view.z * 0.01745 * 1.2;
-        return clamp((ridge(az, k.glow.z) - alt) * perDegree + 0.5, 0.0, 1.0);
+        return clamp((ridges(atan2(h.x, h.y), k.glow.z) - alt) * perDegree + 0.5, 0.0, 1.0);
     }
 
-    // Sky glow from altitude, twilight, moonlight and airglow, and the Milky Way.
+    // The sky's own light: airglow, the glow of a distant town, twilight, moonlight scattered by the air, and the
+    // Milky Way photograph, all dimmed and reddened by the air along the way. The result is linear light.
     fragment float4 skyBack(V in [[stage_in]], constant U &u [[buffer(0)]], constant Sky &k [[buffer(1)]],
-                            texture2d<float> mw [[texture(0)]]) {
+                            texture2d<float> photo [[texture(0)]], texture2d<float> outline [[texture(1)]]) {
         float3 h = lookAt(in.uv * u.res, k, u.res);
         float alt = h.z;
-        float low = exp(-max(alt, 0.0) * 5.0);
-        float3 sky = mix(float3(0.0022, 0.0032, 0.0085), float3(0.008, 0.011, 0.02), low);
-        sky += float3(0.003, 0.0065, 0.004) * exp(-pow((alt - 0.17) / 0.12, 2.0));   // faint green airglow band
+        float up = max(alt, 0.0);
+        float deg = asin(clamp(alt, -1.0, 1.0)) * 57.29578;
+        float3 T = extinction(airmassOf(alt));
+        float az = atan2(h.x, h.y);
 
-        // Twilight and daylight: a deep blue dome with a warm glow on the Sun's side of the horizon.
+        // Airglow in a thin layer 90 km up: the green oxygen line, brightening toward the horizon (van Rhijn) until
+        // the air in between swallows it.
+        float vr = 1.0 / sqrt(max(1.0 - 0.972 * (1 - alt * alt), 0.02));
+        float3 sky = float3(0.0016, 0.0036, 0.0019) * vr * T * (0.8 + 0.4 * fbm(float2(az * 3.0, deg * 0.08) + k.glow.z, 3));
+        sky += float3(0.0013, 0.0019, 0.0036) * (0.75 + 0.5 * exp(-up * 4.0));   // starlight scattered by the air
+
+        // A town below the horizon: a warm dome with a long tail.
+        float toward = 0.25 + 0.75 * pow(0.5 + 0.5 * cos(az - k.extra.y), 2.0);
+        float dome = exp(-max(deg, 0.0) / 11.0) * 0.7 + exp(-max(deg, 0.0) / 40.0) * 0.3;
+        sky += float3(1.0, 0.62, 0.32) * 0.011 * k.extra.z * toward * dome * (0.85 + 0.3 * noise(float2(az * 5.0, 1.7)));
+
+        // Twilight and daylight: Rayleigh blue overhead, a warm glow on the Sun's side of the horizon, and the pink
+        // anti-twilight arch opposite it.
         float tw = k.glow.y;
-        float toSun = dot(h, k.sun.xyz);
-        float3 sunDir2 = normalize(float3(k.sun.xy, 0) + 1e-5);
-        float side = max(dot(normalize(float3(h.xy, 0) + 1e-5), sunDir2), 0.0);
-        sky += tw * tw * (float3(0.006, 0.013, 0.032) * (0.5 + 0.5 * low));
-        sky += tw * tw * tw * float3(0.10, 0.045, 0.016) * pow(side, 3.0) * low * low;
-        sky += smoothstep(-2.0, 6.0, k.sun.w) * float3(0.004, 0.012, 0.035) * (0.6 + 0.4 * low);
-        sky += smoothstep(-6.0, 4.0, k.sun.w) * float3(0.3, 0.2, 0.1) * pow(max(toSun, 0.0), 40.0) * 0.4;
+        float3 sunFlat = float3(k.sun.xy, 0);
+        float side = dot(normalize(float3(h.xy, 0) + 1e-5), normalize(sunFlat + 1e-5));
+        sky += tw * tw * float3(0.0075, 0.0165, 0.042) * (0.55 + 0.45 * (1 - up));
+        sky += tw * tw * tw * float3(0.17, 0.075, 0.026) * pow(max(side, 0.0), 3.0) * exp(-max(deg, 0.0) / 9.0);
+        sky += tw * tw * tw * float3(0.5, 0.3, 0.36) * 0.05 * pow(max(-side, 0.0), 2.0) * exp(-pow((deg - 9.0) / 7.0, 2.0));
+        sky += smoothstep(-2.0, 6.0, k.sun.w) * float3(0.004, 0.012, 0.035) * (0.6 + 0.4 * (1 - up));
+        sky += smoothstep(-6.0, 4.0, k.sun.w) * float3(0.3, 0.2, 0.1) * pow(max(dot(h, k.sun.xyz), 0.0), 40.0) * 0.4;
 
-        // Moonlight scatters blue across the sky and pools around the Moon.
+        // Moonlight scattered by air (blue, Rayleigh) and haze (white, forward-peaked Henyey-Greenstein).
         float moon = k.glow.x;
-        float toMoon = max(dot(h, k.moon.xyz), 0.0);
-        sky += moon * (float3(0.004, 0.008, 0.018) + float3(0.04, 0.04, 0.045) * pow(toMoon, 60.0) + float3(0.02, 0.022, 0.03) * pow(toMoon, 8.0) * 0.2);
+        float cg = dot(h, k.moon.xyz);
+        float hg = (1 - 0.5625) / pow(1 + 0.5625 - 1.5 * cg, 1.5);
+        sky += moon * (float3(0.30, 0.5, 1.0) * 0.011 * 0.75 * (1 + cg * cg) * (0.45 + 0.55 * (1 - up))
+                       + float3(1.0, 0.96, 0.9) * 0.0022 * hg);
 
-        // The Milky Way: the outline's brightness steps, softened, with mottled star clouds and dust lanes.
-        float3 g = GALACTIC * cols(k.eq, h);
-        constexpr sampler s(filter::linear, address::repeat);
-        float2 uv = float2(fract(atan2(g.y, g.x) / TAU), asin(clamp(g.z, -1.0, 1.0)) / PI + 0.5);
-        float2 o = float2(1.2 / 720, 1.2 / 360);
-        float lev = mw.sample(s, uv).r * 0.36 + 0.16 * (mw.sample(s, uv + float2(o.x, 0)).r + mw.sample(s, uv - float2(o.x, 0)).r
-                  + mw.sample(s, uv + float2(0, o.y)).r + mw.sample(s, uv - float2(0, o.y)).r);
-        float3 galaxy = 0;
-        if (lev > 0.003) {
-            float3 q = g * 9.0;
-            float clouds = fbm(q + 3.7, 5);
-            float grain = fbm(q * 5.0 + 1.3, 3);
-            float lanes = smoothstep(0.5, 0.72, fbm(q * 1.8 + 21.0, 4)) * exp(-abs(g.z) * 9.0);
-            float b = lev * (0.35 + 1.3 * clouds * clouds) * (0.7 + 0.6 * grain) * (1 - 0.65 * lanes);
-            float core = exp(-pow(acos(clamp(g.x, -1.0, 1.0)) / 0.75, 2.0));
-            float3 tint = mix(float3(0.62, 0.70, 0.95), float3(1.0, 0.80, 0.58), core * 0.8 + lanes * 0.2);
-            tint = mix(tint, float3(1.0, 0.55, 0.6), smoothstep(0.62, 0.8, fbm(q * 2.6 + 7.0, 3)) * 0.35);
-            float clear = 1 - 0.6 * max(moon * 1.4, tw);
-            galaxy = tint * b * 0.045 * clear * smoothstep(-0.02, 0.25, alt);
-        }
-        return float4(sky + galaxy, 1);
+        // The real Milky Way, aligned to the sky, a little softer than the screen so its own stars melt into the glow.
+        float3 g = cols(k.eq, h);
+        float spread = 6.0 / (u.res.y * k.view.x);
+        float3 mw = k.extra.x > 0.5 ? milkyWay(photo, g, spread) : milkyWayOutline(outline, g);
+        sky += max(mw - 0.004, 0.0) * 0.42 * T;
+        return float4(sky, 1);
     }
 
     struct StarIn { float4 pos; float4 color; };
@@ -679,17 +695,18 @@ import simd
         return o;
     }
 
-    struct DiscOut { float4 pos [[position]]; float2 uv; float4 color; float4 light; float2 north; };
+    struct DiscOut { float4 pos [[position]]; float2 uv; float4 color; float4 light; float2 north; float radius; };
 
-    // The Moon (dir.w 1) and Sun (dir.w 2), drawn three times their true size. The Moon's light direction is
-    // in the quad's frame (x right, y up, z toward us), and `north` turns its face the way the sky does.
+    // The Moon (dir.w 1) and Sun (dir.w 2), drawn three times their true size. The Moon's light direction is in the quad's
+    // frame (x right, y up, z toward us), and `north` turns its face as the sky does: lunar north is the ecliptic pole.
     vertex DiscOut discVertex(uint vid [[vertex_id]], uint iid [[instance_id]], constant U &u [[buffer(0)]],
                               constant Sky &k [[buffer(1)]], const device BodyIn *bodies [[buffer(2)]]) {
         BodyIn b = bodies[iid];
         float3 c = rows(k.cam, b.dir.xyz);
         float2 center = toPixels(stereo(c, k.view.x), k, u.res);
         float2 corner = float2(vid & 1, vid >> 1) * 2 - 1;
-        float3 pole = float3(k.eq[0].z, k.eq[1].z, k.eq[2].z);
+        float3 colY = float3(k.eq[0].y, k.eq[1].y, k.eq[2].y), colZ = float3(k.eq[0].z, k.eq[1].z, k.eq[2].z);
+        float3 pole = normalize(-0.39777 * colY + 0.91748 * colZ);
         float3 toward[2] = { k.sun.xyz, pole };
         float2 dirs[2];
         for (int i = 0; i < 2; i++) {
@@ -703,13 +720,15 @@ import simd
         DiscOut o;
         o.pos = pixelToClip(center + corner * radius * 4.0, u.res);
         o.uv = corner;
-        o.color = float4(b.color.rgb, smoothstep(-0.02, 0.03, b.dir.z));
+        float3 tint = b.dir.w < 1.5 ? pow(extinction(airmassOf(b.dir.z)), 0.7) * 1.5 : float3(1);
+        o.color = float4(b.color.rgb * tint, smoothstep(-0.02, 0.03, b.dir.z));
         o.light = b.dir.w < 1.5 ? float4(dirs[0] * sini, cosi, 1) : float4(0, 0, 1, -1);
         o.north = dirs[1];
+        o.radius = radius;
         return o;
     }
 
-    // Dark maria where they lie on the Moon's near side, in disc coordinates with lunar north up.
+    // Dark maria where they lie on the Moon's near side, for when the map hasn't arrived.
     inline float maria(float2 q) {
         const float4 seas[8] = { float4(-0.3, 0.42, 0.27, 0.5), float4(0.17, 0.4, 0.17, 0.5), float4(0.3, 0.1, 0.21, 0.45),
                                  float4(0.68, 0.32, 0.11, 0.55), float4(-0.58, 0.02, 0.34, 0.4), float4(-0.15, -0.33, 0.18, 0.35),
@@ -720,24 +739,37 @@ import simd
             dark = max(dark, seas[i].w * smoothstep(seas[i].z, seas[i].z * 0.4, length(d)));
         }
         dark *= 0.8 + 0.4 * noise(q * 6.0);
-        float tycho = 0.25 * smoothstep(0.08, 0.0, length(q - float2(-0.12, -0.7)));
-        return 1 - dark + tycho;
+        return 1 - dark;
     }
 
-    // The Moon with its terminator and faint earthshine; the Sun as a limb-darkened disc. Both carry a halo, since
-    // the eye never sees them as hard discs.
-    fragment float4 discFragment(DiscOut in [[stage_in]]) {
+    // The Moon from NASA's LRO colour map, lit the way rock is (Lommel-Seeliger, so a full Moon is flat and the
+    // terminator soft) with a trace of earthshine; the Sun as a limb-darkened disc. Both carry a halo, since the eye
+    // never sees them as hard discs.
+    fragment float4 discFragment(DiscOut in [[stage_in]], texture2d<float> moon [[texture(0)]]) {
+        constexpr sampler s(filter::linear, mip_filter::linear, s_address::repeat, t_address::clamp_to_edge);
         float2 q = in.uv * 4.0;
+        q.y = -q.y;
         float r2 = dot(q, q);
-        float edge = smoothstep(1.06, 0.94, sqrt(r2));
+        float edge = smoothstep(1.04, 0.96, sqrt(r2));
         float3 c = 0;
         if (in.light.w > 0) {
             float3 n = float3(q, sqrt(max(1 - r2, 0.0)));
-            float lit = smoothstep(-0.04, 0.08, dot(n, in.light.xyz));
-            float2 m = float2(dot(q, float2(in.north.y, -in.north.x)), dot(q, in.north));
-            c = in.color.rgb * (lit * maria(m) * 0.8 + 0.01) * edge;
+            float2 N = in.north, R = float2(N.y, -N.x);
+            float2 m = float2(dot(q, R), dot(q, N));
+            float3 albedo;
+            if (moon.get_width() > 8) {
+                float lon = atan2(m.x, n.z), lat = asin(clamp(m.y, -1.0, 1.0));
+                float lod = max(log2(float(moon.get_width()) / (TAU * max(in.radius, 1.0))) + 0.3, 0.0);
+                albedo = moon.sample(s, float2(0.5 + lon / TAU, 0.5 - lat / PI), level(lod)).rgb * 1.5;
+            } else {
+                albedo = float3(0.8) * maria(m);
+            }
+            float lamb = max(dot(n, in.light.xyz), 0.0);
+            float lit = smoothstep(0.0, 0.05, lamb) * 2.0 * lamb / (lamb + n.z + 0.02);
+            float shine = 0.012 * (1 - 0.5 * (in.light.z + 1));
+            c = in.color.rgb * albedo * (lit + shine) * edge;
             float lightness = (in.light.z + 1) * 0.5;
-            c += in.color.rgb * lightness * (exp(-sqrt(r2) * 1.6) * 0.06 + exp(-r2 * 0.5) * 0.05) * (1 - edge);
+            c += in.color.rgb * lightness * (exp(-sqrt(r2) * 1.6) * 0.05 + exp(-r2 * 0.5) * 0.04) * (1 - edge);
         } else {
             float limb = sqrt(max(1 - r2, 0.0));
             c = in.color.rgb * (0.5 + 0.5 * limb) * 3.0 * edge;
@@ -775,31 +807,44 @@ import simd
         return in.color * w * (body * 1.4 + smoothstep(0.92, 1.0, in.along) * 2.5);
     }
 
-    // Puts the ground in front of everything, adds the glow and tone maps.
+    // Puts the land in front of everything and adds the glow. Linear light out, for the lens to develop.
     fragment float4 skyFinish(V in [[stage_in]], constant U &u [[buffer(0)]], constant Sky &k [[buffer(1)]],
                               texture2d<float> light [[texture(0)]], texture2d<float> glow [[texture(1)]],
                               texture2d<float> back [[texture(2)]]) {
         constexpr sampler s(filter::linear, address::clamp_to_edge);
-        float3 c = back.sample(s, in.uv).rgb + light.sample(s, in.uv).rgb + glow.sample(s, in.uv).rgb * 0.55;
+        float3 sky = back.sample(s, in.uv).rgb;
+        float3 bloomed = glow.sample(s, in.uv).rgb;
+        float3 c = sky + light.sample(s, in.uv).rgb + bloomed * 0.55;
         float3 h = lookAt(in.uv * u.res, k, u.res);
-        float cover = groundCover(h, k, u.res);
-        float below = clamp(-h.z * 6, 0.0, 1.0);
-        float3 ground = mix(float3(0.0045, 0.0055, 0.0085), float3(0.0018, 0.002, 0.003), below);
-        ground *= 0.75 + 0.5 * fbm(in.uv * float2(u.res.x / u.res.y, 1) * 9.0 + k.glow.z, 4);
-        ground += k.glow.y * k.glow.y * float3(0.006, 0.008, 0.014) + k.glow.x * float3(0.002, 0.0025, 0.004);
-        ground += glow.sample(s, in.uv).rgb * 0.08;
-        c = mix(c, ground, cover);
-        return float4(film(c), 1);
+        float3 cover = landCover(h, k, u.res);
+        if (cover.x > 0) {
+            // Each rank takes the colour of the sky above it, darker the nearer it is, so the far mountains sit in
+            // haze and the treeline is nearly black against the glow.
+            float2 p = in.uv * float2(u.res.x / u.res.y, 1);
+            float deg = asin(clamp(h.z, -1.0, 1.0)) * 57.29578;
+            float depth = max(-deg, 0.0);
+            float grain = 0.75 + 0.5 * fbm(float2(p.x * 40.0, p.y * 9.0) + k.glow.z, 4);
+            float3 skyHere = sky + bloomed * 0.1;
+            // Haze lightens the land toward its feet; ridges and gullies streak it; the foreground fades into darkness.
+            float haze = 1.0 + 0.5 * exp(-max(deg, 0.0) / 1.6);
+            float3 farC = skyHere * 0.55 * haze * (0.8 + 0.4 * grain) + float3(0.0008, 0.001, 0.0016);
+            float3 midC = skyHere * 0.22 * grain * (1.0 + 0.3 * exp(-max(deg, 0.0) / 0.8)) + float3(0.0004, 0.0005, 0.0008);
+            float3 nearC = skyHere * (0.04 + 0.05 * exp(-depth / 7.0)) * grain + float3(0.0001, 0.00012, 0.00018);
+            c = mix(c, farC, cover.x);
+            c = mix(c, midC, cover.y);
+            c = mix(c, nearC, cover.z);
+        }
+        return float4(c, 1);
     }
 
-    // Labels in the sky hide behind the ground.
+    // Labels in the sky hide behind the land.
     fragment float4 skyLabelFragment(LabelOut in [[stage_in]], constant U &u [[buffer(0)]], constant Sky &k [[buffer(2)]],
                                      texture2d<float> atlas [[texture(0)]]) {
         constexpr sampler s(filter::linear, address::clamp_to_edge);
         float a = atlas.sample(s, in.uv).r;
         if (a < 0.002) return 0;
-        float cover = groundCover(lookAt(in.pos.xy, k, u.res), k, u.res);
-        return in.color * a * (1 - cover);
+        float3 cover = landCover(lookAt(in.pos.xy, k, u.res), k, u.res);
+        return in.color * a * (1 - max(cover.x, max(cover.y, cover.z)));
     }
     """
 }

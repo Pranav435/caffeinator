@@ -10,6 +10,8 @@ import Metal
     var ready: Bool { get }
     /// Live facts for the caption and VoiceOver, such as "237 earthquakes today, largest M4.9 near Vanuatu".
     var facts: String? { get }
+    /// Whose photograph or map is on screen, such as "Milky Way: ESO/S. Brunier". Shown in the caption, not read aloud.
+    var credit: String? { get }
     func draw(_ f: Frame)
 }
 
@@ -17,6 +19,7 @@ extension Scene {
     var scale: Float { 0.5 }
     var ready: Bool { true }
     var facts: String? { nil }
+    var credit: String? { nil }
 }
 
 @MainActor struct Frame {
@@ -67,7 +70,7 @@ struct SceneKind: Identifiable {
 
 @MainActor extension SceneKind {
     /// Every scene, grouped in Settings by family. Each folder under Scenes/ contributes its own list.
-    static let all: [SceneKind] = mathScenes + fieldScenes + labScenes + spaceScenes + earthScenes + skyScenes
+    static let all: [SceneKind] = mathScenes + fieldScenes + labScenes + spaceScenes + worldScenes + earthScenes + skyScenes
 
     static func named(_ id: String) -> SceneKind? { all.first { $0.id == id } }
 }

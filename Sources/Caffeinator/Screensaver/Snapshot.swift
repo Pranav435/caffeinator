@@ -51,7 +51,8 @@ import Metal
             let recorder = audio ? Recorder(folder.appendingPathComponent("\(kind.id).m4a")) : nil
             stage.sound = recorder?.synth
             frame(stage, output, dt: dt)
-            let deadline = Date() + 45
+            // The first run downloads photographs, some several megabytes.
+            let deadline = Date() + 180
             while stage.scene?.ready == false, Date() < deadline { RunLoop.main.run(until: .now + 0.05) }
             var t: Float = dt
             for at in times {

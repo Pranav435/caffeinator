@@ -3,16 +3,16 @@ import Metal
 @MainActor extension SceneKind {
     static let fieldScenes: [SceneKind] = [
         SceneKind(id: "black-hole", name: "Black Hole", family: .physics,
-                  about: "A black hole bends the light of its glowing accretion disk into a halo: the far side of the disk arches over a perfectly black shadow, one side burns blue-white where the gas rushes toward you and the other glows dim orange, and the stars behind are smeared into rings.",
+                  about: "A Schwarzschild black hole seen from about thirty radii out, ray traced against the real Milky Way photograph. A black shadow sits inside a thin, glowing disk of gas that tilts toward you: one side is blazing white where it rushes at you, the other dim and ochre, and the stars and dust lanes behind are bent into arcs and a faint ring around the hole.",
                   make: BlackHole.init, gain: 0.65),
         SceneKind(id: "ink", name: "Ink in Water", family: .physics,
-                  about: "Drops of indigo, vermilion and gold ink fall into dark, slowly stirred water and bloom into curling mushroom clouds and marbled ribbons that swirl, fold into each other and fade.",
-                  make: InkInWater.init),
+                  about: "A glass tank of still water, seen from the side and lit from behind by a dim, warm softbox. Drops of Prussian blue, vermilion and gold ink fall in, sink as ragged plumes, roll into mushroom-shaped vortex rings and fold into marbled veils, while mixed inks darken or turn green. Tiny bubbles cling to the glass and dust drifts in the light.",
+                  make: InkInWater.init, gain: 0.6),
         SceneKind(id: "slime", name: "Slime Mold", family: .physics,
-                  about: "A million glowing specks, each following the chemical trail left by the others, grow a living web of gold and teal veins like a slime mold hunting for food; now and then food appears at the cities around Tokyo and the web rebuilds itself into something like the Tokyo rail map.",
-                  make: SlimeMold.init, gain: 0.9),
+                  about: "A macro photograph, from above, of the slime mold Physarum polycephalum growing on pale agar in a petri dish: a bright yellow network of glossy tubes that swell and slacken as cytoplasm shuttles through them. Now and then oat flakes appear at the positions of 36 cities around Tokyo, and the mold rebuilds something like the Tokyo rail network between them.",
+                  make: SlimeMold.init, gain: 0.8),
         SceneKind(id: "aurora", name: "Northern Lights", family: .physics,
-                  about: "Northern lights over a dark lake ringed by mountains and spruce: green curtains with violet hems and red crowns ripple across the starry sky and shimmer in the water, as lively as the real geomagnetic activity right now.",
+                  about: "A long-exposure photograph of the northern or southern lights over a still fjord or lake ringed by snowy mountains, under the real Milky Way and stars for this place and time. Rayed green curtains with red crowns and pink lower edges fold across the sky and mirror in the water, as lively as the real geomagnetic Kp index right now.",
                   make: AuroraCurtains.init, gain: 0.9),
     ]
 }

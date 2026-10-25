@@ -1,49 +1,63 @@
 import AppKit
+import ImageIO
 import Metal
 import simd
 
-/// The Earth shared by the Live Earth scenes. Natural Earth land and lakes are rasterised once into an
-/// equirectangular coverage mask whose mipmaps give crisp, screen-constant coastlines at any zoom; NASA's Black Marble
-/// adds city lights on the night side when it can be fetched. `draw` ray-traces the globe lit by the real Sun.
+/// The Earth shared by the Live Earth scenes, made from real imagery: NASA's Blue Marble Next Generation for the
+/// current month (land, sea ice, snow), yesterday's clouds cut out of the VIIRS satellites' global mosaic, NASA's
+/// Black Marble city lights, and ESO's Milky Way behind. `draw` ray-traces it lit by the real Sun through a physically
+/// based atmosphere (Rayleigh and Mie scattering, ozone), with clouds 6 km up casting soft shadows, sunglint on the
+/// sea and airglow over the night-side limb. Natural Earth's outlines serve as the water mask, and as the look until
+/// the photographs arrive.
 ///
 /// Coordinates are Earth-fixed, in Earth radii: x toward 0° 0°, y toward 0° 90° E, z toward the north pole.
 /// Scenes compile `Globe.metal` in front of their own source to project points the same way the globe does.
 @MainActor final class Globe {
     struct Style {
-        var coast: Float = 1
-        var land: Float = 1
-        var graticule: Float = 1
-        /// City lights on the night side.
         var lights: Float = 1
         var atmosphere: Float = 1
-        var stars: Float = 0
-        /// Brightness of the unlit hemisphere's land and ocean.
-        var night: Float = 1
-        /// Sunlight glinting off the ocean.
+        /// The Milky Way behind the Earth. Photographs exposed for the day side barely show it.
+        var stars: Float = 0.15
+        /// The green airglow line above the night-side limb.
+        var airglow: Float = 1
         var glint: Float = 1
-        var coastColor: SIMD3<Float> = [0.32, 0.68, 1.0]
-        /// Graticule spacing in degrees.
-        var spacing: Float = 15
-        /// 1 for real sunlight; 0 shows the whole globe as night.
-        var daylight: Float = 1
+        var clouds: Float = 1
+        /// Moonlight on the night side as a share of sunlight, at full Moon. Real moonlight is about 1/400,000 of
+        /// sunlight; this exaggerates it the way a long exposure of the night side would.
+        var moonlight: Float = 0.01
+        /// The night sky's own faint light on the night side (starlight and airglow), as a share of sunlight.
+        var nightGlow: Float = 0.004
     }
 
+    static let credit = "Earth: NASA Blue Marble, Black Marble and GIBS/VIIRS · Milky Way: ESO/S. Brunier"
     static let maskWidth = 4096, maskHeight = 2048
     private static let lightsURL = URL(string: "https://eoimages.gsfc.nasa.gov/images/imagerecords/144000/144898/BlackMarble_2016_01deg.jpg")!
+    /// NASA's 2002 cloud composite: the clouds when yesterday's can't be had, and over the polar night where VIIRS sees nothing.
+    private static let oldCloudsURL = URL(string: "https://eoimages.gsfc.nasa.gov/images/imagerecords/57000/57747/cloud_combined_2048.jpg")!
+    /// Blue Marble Next Generation (topography and bathymetry), one record per month of 2004.
+    private static let months = [73580, 73605, 73630, 73655, 73701, 73726, 73751, 73776, 73801, 73826, 73884, 73909]
     /// Shared while any Earth scene holds it, so the textures go when the screensaver ends.
     private static weak var instance: Globe?
 
     /// Land coverage, 0 (sea) to 1 (land), with mipmaps.
     let land: MTLTexture
-    /// Night lights (stored as the square root of linear radiance), once Black Marble has arrived.
+    private(set) var surface: MTLTexture?
+    private(set) var clouds: MTLTexture?
     private(set) var lights: MTLTexture?
-    /// True once the city lights have loaded or failed.
-    private(set) var lightsSettled = false
+    private(set) var sky: MTLTexture?
+    /// The day of the VIIRS passes the clouds come from, or nil for NASA's old cloud map.
+    private(set) var cloudDay: Date?
+    private var settled = 0
+    private var cloudsChecked = Date.distantPast
+    private var cloudsLoading = false
     private let blank: MTLTexture
-    private let mask: [UInt8]
-    private static let maskStep = 4
-    private let surface: MTLRenderPipelineState
-    private let tone: MTLRenderPipelineState
+    private let gpu: GPU
+    private let pass: MTLRenderPipelineState
+    private let opacity: MTLComputePipelineState
+    private let finishClouds: MTLComputePipelineState
+
+    /// True once every photograph has loaded or failed.
+    var ready: Bool { settled >= 4 }
 
     static func shared(_ gpu: GPU) throws -> Globe {
         if let instance { return instance }
@@ -53,50 +67,147 @@ import simd
     }
 
     private init(gpu: GPU) throws {
+        self.gpu = gpu
         let library = try gpu.library(Self.metal + Self.passes)
-        surface = try gpu.pipeline(library, "globeSurface")
-        tone = try gpu.pipeline(library, "globeFinish")
+        pass = try gpu.pipeline(library, "globeSurface")
+        opacity = try gpu.kernel(library, "cloudOpacity")
+        finishClouds = try gpu.kernel(library, "cloudFinish")
         let w = Self.maskWidth, h = Self.maskHeight
         let pixels = Self.rasterise(w, h)
         land = pixels.withUnsafeBytes { Self.mipmapped(gpu, w, h, $0.baseAddress!) }
-        // A coarse copy for looking up land and sea on the CPU.
-        let s = Self.maskStep
-        mask = (0..<(h / s)).flatMap { y in (0..<(w / s)).map { x in pixels[(y * s + s / 2) * w + x * s + s / 2] } }
         var zero: UInt8 = 0
         blank = gpu.texture(1, 1, .r8Unorm, bytes: &zero, bytesPerRow: 1)
+        let year = 365 * 86400.0
         Task { @MainActor in
-            if let data = await Feed.data(Self.lightsURL, maxAge: 90 * 86400) {
-                let decoded = await Task.detached { Self.lightLevels(data) }.value
-                if let (bytes, w, h) = decoded {
-                    lights = bytes.withUnsafeBytes { Self.mipmapped(gpu, w, h, $0.baseAddress!) }
-                }
-            }
-            lightsSettled = true
+            surface = await Imagery.texture(Self.blueMarble(.now), gpu, maxSize: 5400, maxAge: year)
+            settled += 1
+        }
+        Task { @MainActor in
+            lights = await Imagery.texture(Self.lightsURL, gpu, kind: .gray, maxSize: 3600, maxAge: year)
+            settled += 1
+        }
+        Task { @MainActor in
+            sky = await MilkyWay.texture(gpu)
+            settled += 1
+        }
+        Task { @MainActor in
+            await loadClouds(.now)
+            settled += 1
         }
     }
 
-    /// Ray-traces the globe, its atmosphere and the space around it into `target` as linear HDR light.
-    func draw(_ cmd: MTLCommandBuffer, into target: MTLTexture, camera: MTLBuffer, style s: Style, time: Float) {
-        let u = U(res: SIMD2(Float(target.width), Float(target.height)), time: time,
-                  a: [s.coast, s.land, s.graticule, s.lights], b: [s.atmosphere, s.stars, s.night, s.glint],
-                  c: SIMD4(s.coastColor, 0), d: [s.spacing, s.daylight, 0, 0])
-        cmd.draw(surface, into: target, uniforms: u, textures: [land, lights ?? blank], buffers: [camera])
+    static func blueMarble(_ date: Date) -> URL {
+        let month = Calendar(identifier: .gregorian).component(.month, from: date)
+        let id = months[(month + 11) % 12]
+        return URL(string: String(format: "https://eoimages.gsfc.nasa.gov/images/imagerecords/73000/%d/world.topo.bathy.2004%02d.3x5400x2700.jpg", id, month))!
     }
 
-    /// Tone maps the HDR light plus its bloom into the scene's display-ready target.
-    func finish(_ f: Frame, light: MTLTexture, glow: MTLTexture, bloom: Float = 0.6, exposure: Float = 1) {
-        f.cmd.draw(tone, into: f.target, uniforms: f.uniforms([bloom, exposure, 0, 0]), textures: [light, glow])
+    /// A day's global mosaic of VIIRS true colour from Suomi NPP, NOAA-20 and NOAA-21, from NASA GIBS.
+    static func viirs(_ day: Date) -> URL {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = TimeZone(identifier: "UTC")!
+        let d = c.dateComponents([.year, .month, .day], from: day)
+        let layers = ["VIIRS_SNPP", "VIIRS_NOAA20", "VIIRS_NOAA21"].map { $0 + "_CorrectedReflectance_TrueColor" }.joined(separator: ",")
+        let date = String(format: "%04d-%02d-%02d", d.year ?? 2026, d.month ?? 1, d.day ?? 1)
+        return URL(string: "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0"
+            + "&LAYERS=\(layers)&STYLES=&CRS=EPSG:4326&BBOX=-90,-180,90,180&WIDTH=4096&HEIGHT=2048&FORMAT=image/jpeg&TIME=\(date)")!
     }
+
+    /// Clouds from the most recent complete day of VIIRS passes (a day's mosaic fills in a few hours after midnight
+    /// UTC), stepping back a day if one comes back mostly empty, else NASA's old cloud map.
+    private func loadClouds(_ now: Date) async {
+        cloudsLoading = true
+        cloudsChecked = now
+        let old = await Imagery.texture(Self.oldCloudsURL, gpu, kind: .gray, maxSize: 2048, maxAge: 365 * 86400)
+        let base = await Imagery.texture(Self.blueMarble(now), gpu, maxSize: 5400, maxAge: 365 * 86400)
+        var day = now.addingTimeInterval(-30 * 3600)
+        for _ in 0..<3 {
+            let url = Self.viirs(day)
+            if let data = await Feed.data(url, maxAge: 60 * 86400),
+               await Task.detached(priority: .utility, operation: { Self.coverage(data) }).value > 0.6,
+               let mosaic = await Imagery.texture(url, gpu, maxSize: 4096, maxAge: 60 * 86400) {
+                clouds = extract(mosaic, base: base, old: old, subsolar: Float(Astro.sun(day).dec))
+                cloudDay = day
+                cloudsLoading = false
+                return
+            }
+            day = day.addingTimeInterval(-86400)
+        }
+        if clouds == nil, let old { clouds = extract(nil, base: nil, old: old, subsolar: 0) }
+        cloudsLoading = false
+    }
+
+    /// Fetches newer clouds once a new day's mosaic should be complete. Scenes call this now and then.
+    func refresh(_ now: Date) {
+        guard !cloudsLoading, now.timeIntervalSince(cloudsChecked) > 3600, let day = cloudDay,
+              Self.viirs(now.addingTimeInterval(-30 * 3600)) != Self.viirs(day) else { return }
+        Task { @MainActor in await loadClouds(now) }
+    }
+
+    /// Share of the mosaic between 60° S and 60° N that has data.
+    private nonisolated static func coverage(_ data: Data) -> Double {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                                                          kCGImageSourceThumbnailMaxPixelSize: 256] as CFDictionary)
+        else { return 0 }
+        let w = image.width, h = image.height
+        var bytes = [UInt8](repeating: 0, count: w * h)
+        let ok = bytes.withUnsafeMutableBytes { raw -> Bool in
+            guard let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w,
+                                      space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return false }
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard ok else { return 0 }
+        let rows = (h / 6)..<(h * 5 / 6)
+        let filled = rows.reduce(0) { sum, y in sum + (0..<w).filter { bytes[y * w + $0] > 6 }.count }
+        return Double(filled) / Double(rows.count * w)
+    }
+
+    /// Turns a VIIRS mosaic into cloud opacity against the cloud-free Blue Marble, without the sunglint, on the GPU.
+    private func extract(_ mosaic: MTLTexture?, base: MTLTexture?, old: MTLTexture?, subsolar: Float) -> MTLTexture? {
+        let w = mosaic?.width ?? old?.width ?? 1, h = mosaic?.height ?? old?.height ?? 1
+        func make(_ format: MTLPixelFormat) -> MTLTexture? {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: w, height: h, mipmapped: true)
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            return gpu.device.makeTexture(descriptor: d)
+        }
+        guard let raw = make(.rgba16Float), let out = make(.r8Unorm), let cmd = gpu.queue.makeCommandBuffer() else { return nil }
+        // Without a mosaic, every pixel counts as missing and takes the old map.
+        cmd.compute(opacity, w, h, uniforms: U(a: [base != nil ? 1 : 0, old != nil ? 1 : 0, 0, 0]),
+                    textures: [mosaic ?? blank, base ?? blank, old ?? blank, raw])
+        if let blit = cmd.makeBlitCommandEncoder() { blit.generateMipmaps(for: raw); blit.endEncoding() }
+        cmd.compute(finishClouds, w, h, uniforms: U(a: [subsolar, 0, 0, 0]), textures: [raw, land, out])
+        if let blit = cmd.makeBlitCommandEncoder() { blit.generateMipmaps(for: out); blit.endEncoding() }
+        cmd.commit()
+        return out
+    }
+
+    /// Ray-traces the globe, its atmosphere and the sky around it into `target` as linear HDR light.
+    func draw(_ cmd: MTLCommandBuffer, into target: MTLTexture, camera: MTLBuffer, style s: Style, date: Date, time: Float) {
+        let moon = Astro.subpoint(Astro.moon(date), date)
+        let phase = Float(Astro.moonPhase(date).lit)
+        let u = U(res: SIMD2(Float(target.width), Float(target.height)), time: time,
+                  a: [s.lights, s.atmosphere, s.stars, s.airglow],
+                  b: [s.glint, clouds == nil ? 0 : s.clouds, surface == nil ? 0 : 1, sky == nil ? 0 : 1],
+                  c: SIMD4(Self.geo(moon.lat, moon.lon), s.moonlight * phase), d: [time, s.nightGlow, 0, 0])
+        cmd.draw(pass, into: target, uniforms: u, textures: [surface ?? blank, clouds ?? blank, lights ?? blank, land, sky ?? blank],
+                 buffers: [camera])
+    }
+
+    /// Land and sea at a quarter of a degree, for looking up on the CPU.
+    private static let coarse = rasterise(1440, 720)
 
     /// Whether a point is land, from the 1:50m outlines at a quarter of a degree.
-    func isLand(lat: Double, lon: Double) -> Bool {
-        let w = Self.maskWidth / Self.maskStep, h = Self.maskHeight / Self.maskStep
+    static func isLand(lat: Double, lon: Double) -> Bool {
+        let w = 1440, h = 720
         let x = Int(((lon + 180) / 360 * Double(w)).rounded(.down)), y = Int(((90 - lat) / 180 * Double(h)).rounded(.down))
-        return mask[min(max(y, 0), h - 1) * w + (x % w + w) % w] > 127
+        return coarse[min(max(y, 0), h - 1) * w + (x % w + w) % w] > 127
     }
 
     /// A rough place name: an ocean or sea ("the South Atlantic") or a landmass ("Africa").
-    func region(lat: Double, lon: Double) -> String {
+    static func region(lat: Double, lon: Double) -> String {
         if isLand(lat: lat, lon: lon) {
             if lat < -60 { return "Antarctica" }
             if lat > 59, lon > -75, lon < -10 { return "Greenland" }
@@ -123,24 +234,24 @@ import simd
 
     // MARK: Geometry
 
-    static func geo(_ lat: Double, _ lon: Double, _ r: Double = 1) -> SIMD3<Float> {
+    nonisolated static func geo(_ lat: Double, _ lon: Double, _ r: Double = 1) -> SIMD3<Float> {
         let a = lat * .pi / 180, o = lon * .pi / 180
         return SIMD3(Float(r * cos(a) * cos(o)), Float(r * cos(a) * sin(o)), Float(r * sin(a)))
     }
 
-    static func latLon(_ q: SIMD3<Float>) -> (lat: Double, lon: Double) {
+    nonisolated static func latLon(_ q: SIMD3<Float>) -> (lat: Double, lon: Double) {
         let n = simd_normalize(q)
         return (Double(asin(max(-1, min(1, n.z)))) * 180 / .pi, Double(atan2(n.y, n.x)) * 180 / .pi)
     }
 
     /// Unit vector from the Earth's centre toward the Sun, Earth-fixed.
-    static func sun(_ date: Date) -> SIMD3<Float> {
+    nonisolated static func sun(_ date: Date) -> SIMD3<Float> {
         let s = Astro.subpoint(Astro.sun(date), date)
         return geo(s.lat, s.lon)
     }
 
     /// Great-circle distance in kilometres.
-    static func distance(_ a: (lat: Double, lon: Double), _ b: (lat: Double, lon: Double)) -> Double {
+    nonisolated static func distance(_ a: (lat: Double, lon: Double), _ b: (lat: Double, lon: Double)) -> Double {
         let p = geo(a.lat, a.lon), q = geo(b.lat, b.lon)
         return Double(acos(max(-1, min(1, simd_dot(p, q))))) * 6371
     }
@@ -156,11 +267,13 @@ import simd
         /// Focal length in centered units.
         var zoom: Float
         var aspect: Float
+        /// Greenwich sidereal angle in radians, which turns the sky with the Earth.
+        var gmst: Float
 
         /// Looks at the Earth's centre from `distance` radii above a latitude and longitude, north up (over a pole,
-        /// the longitude's meridian points down), turned by `roll` radians.
+        /// the longitude's meridian points down), turned by `roll` radians, with the Sun and stars of `date`.
         init(lat: Float, lon: Float, distance: Float, zoom: Float, roll: Float = 0, shift: SIMD2<Float> = .zero,
-             aspect: Float, sun: SIMD3<Float>) {
+             aspect: Float, date: Date) {
             let a = lat * .pi / 180, o = lon * .pi / 180
             let out = SIMD3(cos(a) * cos(o), cos(a) * sin(o), sin(a))
             let f = -out
@@ -169,7 +282,8 @@ import simd
             let r = east * cos(roll) + up * sin(roll), u = up * cos(roll) - east * sin(roll)
             basis = simd_float3x3(r, u, f)
             eye = out * distance
-            self.sun = sun
+            sun = Globe.sun(date)
+            gmst = Float(Astro.rad(Astro.gmst(date)))
             self.shift = shift
             self.zoom = zoom
             self.aspect = aspect
@@ -206,20 +320,26 @@ import simd
             guard let p = project(q) else { return nil }
             return (CGPoint(x: CGFloat(p.x) * size.width, y: CGFloat(p.y) * size.height), shown(q))
         }
+
+        /// The Earth's apparent radius on the overlay, in points.
+        func radius(_ size: CGSize) -> CGFloat {
+            let d = simd_length(eye)
+            return CGFloat(zoom / (d * d - 1).squareRoot() * 0.5) * size.height
+        }
     }
 
-    /// Per-scene render state: an HDR light buffer, its bloom, and a small ring of camera buffers so the CPU never
-    /// rewrites one the GPU may still be reading.
+    /// Per-scene render state: an HDR light buffer, the camera it's filmed with, and a small ring of camera buffers so
+    /// the CPU never rewrites one the GPU may still be reading.
     @MainActor final class Canvas {
         private let gpu: GPU
-        private let bloom: Bloom
+        let lens: Lens
         private var ring: [MTLBuffer]
         private var slot = 0
         private(set) var light: MTLTexture?
 
         init(gpu: GPU) throws {
             self.gpu = gpu
-            bloom = try Bloom(gpu: gpu)
+            lens = try Lens(gpu: gpu)
             ring = (0..<3).map { _ in gpu.buffer(MemoryLayout<Camera>.stride) }
         }
 
@@ -253,10 +373,14 @@ import simd
             return buffer
         }
 
-        func finish(_ f: Frame, globe: Globe, bloom strength: Float = 0.6, exposure: Float = 1) {
+        /// Develops the light into the frame's target like a photograph. Instrument marks go on top after this.
+        func develop(_ f: Frame, _ look: Lens.Look = Canvas.look) {
             guard let light else { return }
-            globe.finish(f, light: light, glow: bloom.glow(f.cmd, light), bloom: strength, exposure: exposure)
+            lens.develop(f, light, look)
         }
+
+        /// A camera in orbit: clean optics, a little grain.
+        static let look = Lens.Look(exposure: 1.25, bloom: 0.03, halation: 0.012, vignette: 0.28, aberration: 0.8, grain: 0.35)
     }
 
     // MARK: Rasterising
@@ -315,29 +439,6 @@ import simd
             }
         }
         return pixels
-    }
-
-    /// Black Marble's 0.1 degree mosaic as night-light levels: linear radiance above the faint land and ice
-    /// background, stored as its square root for precision in 8 bits.
-    private nonisolated static func lightLevels(_ data: Data) -> ([UInt8], Int, Int)? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
-        let w = image.width, h = image.height
-        var gray = [UInt8](repeating: 0, count: w * h)
-        let ok = gray.withUnsafeMutableBytes { buffer -> Bool in
-            guard let ctx = CGContext(data: buffer.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w,
-                                      space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return false }
-            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
-            return true
-        }
-        guard ok else { return nil }
-        let table: [UInt8] = (0..<256).map { i in
-            let v = Double(i) / 255
-            let linear = v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
-            let level = max(linear - 0.075, 0) / 0.925
-            return UInt8((level.squareRoot() * 255).rounded())
-        }
-        return (gray.map { table[Int($0)] }, w, h)
     }
 
     private static func mipmapped(_ gpu: GPU, _ w: Int, _ h: Int, _ bytes: UnsafeRawPointer) -> MTLTexture {

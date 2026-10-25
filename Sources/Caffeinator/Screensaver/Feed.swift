@@ -47,6 +47,22 @@ enum Feed {
         return CGImageSourceCreateImageAtIndex(source, 0, nil)
     }
 
+    /// Deletes the longest-cached files once the cache passes `limit` bytes, so photographs don't pile up.
+    static func trim(to limit: Int = 1_000_000_000) {
+        let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey]
+        guard let files = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: Array(keys)) else { return }
+        var entries = files.compactMap { url -> (URL, Date, Int)? in
+            guard let v = try? url.resourceValues(forKeys: keys), let date = v.contentModificationDate else { return nil }
+            return (url, date, v.fileSize ?? 0)
+        }
+        var total = entries.reduce(0) { $0 + $1.2 }
+        entries.sort { $0.1 < $1.1 }
+        for (url, _, size) in entries where total > limit {
+            try? FileManager.default.removeItem(at: url)
+            total -= size
+        }
+    }
+
     /// A file name from the URL: FNV-1a hash plus the original extension.
     private static func name(_ url: URL) -> String {
         var hash: UInt64 = 0xcbf2_9ce4_8422_2325

@@ -142,6 +142,34 @@ enum Shaders {
         return float2(-b - h, -b + h);
     }
 
+    // MARK: The real sky
+
+    // Directions are unit vectors: equatorial (J2000) with x toward right ascension 0h and z toward the north celestial
+    // pole; galactic with x toward the galactic centre and z toward the north galactic pole. Multiply by
+    // transpose(EQ_TO_GAL) to go back.
+    constant float3x3 EQ_TO_GAL = float3x3(float3(-0.0548755604, 0.4941094279, -0.8676661490),
+                                           float3(-0.8734370902, -0.4448296300, -0.1980763734),
+                                           float3(-0.4838350155, 0.7469822445, 0.4559837762));
+    // ESO's Milky Way photograph is nearly galactic, but tilted by about three degrees. This frame, fitted to 393
+    // catalogue stars (0.1 degree median error), puts its stars where the real ones are.
+    constant float3x3 EQ_TO_PHOTO = float3x3(float3(-0.0015634, 0.4797950, -0.8773792),
+                                             float3(-0.8908374, -0.3992797, -0.2167588),
+                                             float3(-0.4543195, 0.7812634, 0.4280436));
+
+    // Linear light from the Milky Way photograph (see `MilkyWay`) toward equatorial direction `d`. `spread` is the angle
+    // one screen pixel covers, in radians, which picks the mip level so the sky never shimmers. Jupiter, caught in the
+    // photograph in 2009, is painted over with the sky just above it.
+    inline float3 milkyWay(texture2d<float> t, float3 d, float spread) {
+        constexpr sampler s(filter::linear, mip_filter::linear, s_address::repeat, t_address::clamp_to_edge);
+        float3 g = EQ_TO_PHOTO * d;
+        float2 uv = float2(0.5 - atan2(g.y, g.x) / TAU, 0.5 - asin(clamp(g.z, -1.0, 1.0)) / PI);
+        float lod = log2(max(spread * float(t.get_width()) / TAU, 1e-4));
+        float3 c = t.sample(s, uv, level(lod)).rgb;
+        float jupiter = smoothstep(0.99985, 0.99992, dot(g, float3(0.19237, 0.48919, -0.85068)));
+        if (jupiter > 0) c = mix(c, t.sample(s, uv - float2(0, 0.012), level(lod)).rgb, jupiter);
+        return c;
+    }
+
     // A soft round point sprite. Vertex shaders that draw particles output this.
     struct P { float4 pos [[position]]; float size [[point_size]]; float4 color; };
     fragment float4 sprite(P in [[stage_in]], float2 pc [[point_coord]]) {

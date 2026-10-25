@@ -2,9 +2,12 @@ import AppKit
 import Metal
 import simd
 
-/// Real black hole and neutron star mergers from the LIGO, Virgo and KAGRA catalogue (GWOSC). Two bodies spiral in
-/// with leading-order post-Newtonian timing from their measured masses, slowed down to watch, while spacetime ripples
-/// outward in the two-armed quadrupole pattern; then the merger, the ringdown, and the strain trace along the bottom.
+/// Real binary black hole mergers heard by LIGO. The two black holes spiral together in front of ESO's photograph of
+/// the Milky Way and bend its light as gravitational lenses, with the exact Schwarzschild deflection: black shadows
+/// ringed by thin photon rings, the star clouds smeared into Einstein rings and doubled images, the two shadows merging
+/// into one. The orbit follows leading-order post-Newtonian timing from the measured masses, slowed down to watch.
+/// In the corner, the real Hanford and Livingston strain from GWOSC, whitened and band-passed as in the discovery
+/// paper, and its time–frequency chirp, with a playhead that keeps time with the orbit; the sound is that data too.
 @MainActor final class GravitationalWaves: Scene {
     struct Merger {
         var name: String
@@ -12,6 +15,8 @@ import simd
         var final: Double?
         /// Luminosity distance in megaparsecs.
         var distance: Double
+        var gps: Double = 0
+        var redshift: Double = 0
     }
 
     /// The inspiral of one merger in "visual" time: the true chirp, slowed so the orbit at the innermost stable circular
@@ -20,11 +25,13 @@ import simd
     struct Inspiral {
         static let solarTime = 4.925491e-6        // G M☉ / c³ in seconds
         static let visualOrbit = 0.75             // orbits per second at the innermost stable orbit, on screen
-        static let inspiralTime = 26.0            // seconds of inspiral shown
+        static let inspiralTime = 26.0            // seconds of inspiral shown, unless set
         static let plunge = 0.45
         static let ringdown = 0.9
 
         let m1: Double, m2: Double
+        /// Seconds of inspiral shown before the plunge.
+        var duration = Self.inspiralTime
         var total: Double { m1 + m2 }
         var eta: Double { m1 * m2 / (total * total) }
         var chirpMass: Double { total * pow(eta, 0.6) }
@@ -36,8 +43,8 @@ import simd
         var tauISCO: Double {
             5.0 / 256 * pow(chirpMass * Self.solarTime, -5.0 / 3) * pow(.pi * iscoFrequency, -8.0 / 3) * stretch
         }
-        var tauStart: Double { tauISCO + Self.inspiralTime }
-        var merger: Double { Self.inspiralTime + Self.plunge }
+        var tauStart: Double { tauISCO + duration }
+        var merger: Double { duration + Self.plunge }
 
         /// Orbital phase (radians), separation (in units of the innermost stable orbit), wave amplitude (1 at that orbit)
         /// and orbital angular speed, `s` seconds after the shown inspiral begins.
@@ -45,13 +52,13 @@ import simd
             let wI = 2 * .pi * Self.visualOrbit
             let k = 8.0 / 5 * wI * tauISCO
             let startX = tauStart / tauISCO
-            if s < Self.inspiralTime {
+            if s < duration {
                 let x = (tauStart - s) / tauISCO
                 return (k * (pow(startX, 0.625) - pow(x, 0.625)), pow(x, 0.25), pow(x, -0.25), wI * pow(x, -0.375))
             }
             let phaseISCO = k * (pow(startX, 0.625) - 1)
             if s < merger {
-                let u = (s - Self.inspiralTime) / Self.plunge
+                let u = (s - duration) / Self.plunge
                 return (phaseISCO + wI * Self.plunge * (u + 0.3 * u * u), pow(1 - u, 1.5), 1 + 0.4 * u, wI * (1 + 0.6 * u))
             }
             let v = s - merger
@@ -60,70 +67,108 @@ import simd
         }
     }
 
-    /// Matches `struct GW` in the shader.
-    private struct Params {
-        var body1: SIMD4<Float>     // position xy, radius, kind (0 black hole, 1 neutron star, -1 hidden)
-        var body2: SIMD4<Float>
-        var remnant: SIMD4<Float>   // radius, visibility, kind, whether its well has formed
-        var wave: SIMD4<Float>      // speed, window, samples, amplitude
-        var flash: SIMD4<Float>     // merger flash, kilonova radius, kilonova brightness, well depth
-        var masses: SIMD4<Float>    // mass shares of the two bodies, fade, time
+    /// Matches `struct GWLens` in the shader.
+    private struct LensParams {
+        var hole1: SIMD4<Float>     // position (in total masses), mass
+        var hole2: SIMD4<Float>
+        var hole3: SIMD4<Float>     // the remnant
+        var eye: SIMD4<Float>       // position, focal length
+        var right: SIMD4<Float>     // axis, fade
+        var up: SIMD4<Float>        // axis, exposure
+        var forward: SIMD4<Float>   // axis, 1 when the photograph is missing
+        var sky0: SIMD4<Float>      // rows of the turn from the scene into equatorial coordinates
+        var sky1: SIMD4<Float>
+        var sky2: SIMD4<Float>
+        var scrim: SIMD4<Float>     // the figure's box in uv, darkened a little so the traces read
     }
 
     private static let url = URL(string: "https://gwosc.org/eventapi/json/allevents/")!
     private static let alertURL = URL(string: "https://gracedb.ligo.org/api/superevents/?query=category%3A+Production&format=json&count=1")!
-    private static let famous = ["GW150914", "GW170817", "GW190521", "GW250114", "GW190814", "GW231123", "GW200115", "GW230529",
-                                 "GW151226", "GW170814", "GW190425"]
-    /// Used until the catalogue arrives, or offline with nothing cached (GWTC-1 and GWTC-2.1 values).
+    /// The shown events' parameters (GWTC-1, 2.1 and 3, source frame), used until the catalogue arrives or offline.
     private static let remembered = [
-        Merger(name: "GW150914", m1: 35.6, m2: 30.6, final: 63.1, distance: 440),
-        Merger(name: "GW170817", m1: 1.46, m2: 1.27, final: 2.8, distance: 40),
-        Merger(name: "GW190521", m1: 98.4, m2: 57.2, final: 147.4, distance: 3310),
+        Merger(name: "GW150914", m1: 34.6, m2: 30.0, final: 61.5, distance: 470, gps: 1_126_259_462.4, redshift: 0.10),
+        Merger(name: "GW200129", m1: 34.5, m2: 29.0, final: 60.2, distance: 890, gps: 1_264_316_116.4, redshift: 0.18),
+        Merger(name: "GW170814", m1: 30.9, m2: 24.9, final: 53.2, distance: 610, gps: 1_186_741_861.5, redshift: 0.13),
+        Merger(name: "GW190521", m1: 98.4, m2: 57.2, final: 147.4, distance: 3310, gps: 1_242_442_967.4, redshift: 0.56),
+        Merger(name: "GW190412", m1: 27.7, m2: 9.0, final: 35.6, distance: 720, gps: 1_239_082_262.1, redshift: 0.15),
+        Merger(name: "GW190521_074359", m1: 43.4, m2: 33.4, final: 72.6, distance: 1080, gps: 1_242_459_857.4, redshift: 0.21),
+        Merger(name: "GW170104", m1: 28.7, m2: 20.8, final: 47.5, distance: 1110, gps: 1_167_559_936.6, redshift: 0.22),
+        Merger(name: "GW200224", m1: 40.0, m2: 32.7, final: 68.7, distance: 1710, gps: 1_266_618_172.4, redshift: 0.32),
+        Merger(name: "GW191109", m1: 65.0, m2: 47.0, final: 107.0, distance: 1290, gps: 1_257_296_855.2, redshift: 0.25),
+        Merger(name: "GW190828_063405", m1: 31.9, m2: 25.8, final: 54.3, distance: 2070, gps: 1_251_009_263.7, redshift: 0.38),
+        Merger(name: "GW200311", m1: 34.2, m2: 27.7, final: 59.0, distance: 1170, gps: 1_267_963_151.3, redshift: 0.23),
     ]
+    /// Rich stretches of the Milky Way to put behind the binary, as galactic longitude and latitude in degrees.
+    private static let backdrops: [SIMD2<Double>] = [[2, -3], [287.5, -0.8], [27, -2], [78, 1.5], [302, -1], [335, -1], [9, -5], [263, -3]]
+    /// The chord the eight frequency bands sound as, lowest band first.
+    private static let chord: [Float] = [110, 146.83, 164.81, 220, 246.94, 293.66, 329.63, 440]
 
-    private let surface: MTLRenderPipelineState
+    private let lensPipe: MTLRenderPipelineState
     private let tracePipe: MTLRenderPipelineState
-    private let tonePipe: MTLRenderPipelineState
-    private let bloom: Bloom
+    private let mapPipe: MTLRenderPipelineState
+    private let lens: Lens
     private let rings: [Ring]
+    private let deflection: MTLBuffer
+    private let outline: MTLTexture
+    private var photo: MTLTexture?
+    private var photoDone = false
     private var light: MTLTexture?
 
-    private var events: [Merger] = remembered
-    private var loaded = false
-    private var offline = false
+    private var catalogue: [Merger] = []
+    private var detections = 0
     private var alert: String?
-    private var order: [Int] = []
+    private var order: [Int]
     private var shown = 0
     private var current: Merger
     private var inspiral: Inspiral
     private var eventStart: Float = 0
+    private var signal: GWSignal?
+    private var signalFor: Int?
+    private var loading: Int?
+    private var failed: Set<Int> = []
+    private var firstDone = false
+    private var map: MTLTexture?
+    private var traces: MTLBuffer?
+    private var traceCount = 0
+    private var window = (start: -0.6, end: 0.12)
+    private var range: Float = 6
+    private var started = false
     private var chirped = false
     private var merged = false
     private var captioned = false
-    private let samples = 512
-    private let window = 8.0
 
-    var scale: Float { 0.75 }
-    var ready: Bool { loaded }
+    var scale: Float { 1 }
+    var ready: Bool { photoDone && firstDone }
     var facts: String? { describe() }
+    var credit: String? { "Milky Way: ESO/S. Brunier. Strain: LIGO Scientific Collaboration, Virgo and KAGRA, via GWOSC" }
 
     init(gpu: GPU) throws {
-        let library = try gpu.library(SpaceKit.metal + Self.source)
-        surface = try gpu.pipeline(library, "spacetime")
-        tracePipe = try gpu.pipeline(library, "lineFragment", vertex: "strainVertex", blend: .add)
-        tonePipe = try gpu.pipeline(library, "gwTone")
-        bloom = try Bloom(gpu: gpu)
-        rings = (0..<3).map { _ in Ring(gpu: gpu, bytes: 8192) }
-        current = Self.remembered[0]
-        inspiral = Inspiral(m1: current.m1, m2: current.m2)
-        Task { @MainActor in
-            let catalogue = await Feed.object(Self.url, maxAge: 7 * 86400)
-            let parsed = Self.parse(catalogue)
-            if parsed.isEmpty { offline = true } else { events = parsed }
-            order = []
-            loaded = true
-            next(at: eventStart)
-            if let object = await Feed.object(Self.alertURL, maxAge: 6 * 3600) { alert = Self.parseAlert(object) }
+        let library = try gpu.library(SpaceKit.metal + SpaceSky.metal + Self.source)
+        lensPipe = try gpu.pipeline(library, "gwLensing")
+        tracePipe = try gpu.pipeline(library, "lineFragment", vertex: "gwTraceVertex", blend: .alpha)
+        mapPipe = try gpu.pipeline(library, "gwMapFragment", vertex: "gwMapVertex", blend: .alpha)
+        lens = try Lens(gpu: gpu)
+        rings = (0..<3).map { _ in Ring(gpu: gpu, bytes: 4096) }
+        deflection = gpu.buffer(GWData.deflectionTable())
+        var levels = SkyCatalog.milkyWay.map { $0 * 51 }
+        outline = levels.withUnsafeMutableBytes { gpu.texture(720, 360, .r8Unorm, bytes: $0.baseAddress!, bytesPerRow: 720) }
+        let n = GWData.sources.count
+        let first = (Snapshot.variant ?? 0) % n
+        order = [first] + Array(0..<n).filter { $0 != first }.shuffled()
+        current = Self.remembered[first]
+        inspiral = Self.inspiral(for: current)
+        Task { @MainActor [weak self] in
+            let texture = await MilkyWay.texture(gpu)
+            self?.photo = texture
+            self?.photoDone = true
+        }
+        fetch(first)
+        Task { @MainActor [weak self] in
+            let object = await Feed.object(Self.url, maxAge: 30 * 86400)
+            let parsed = Self.parse(object)
+            self?.catalogue = parsed
+            self?.detections = parsed.count
+            if let object = await Feed.object(Self.alertURL, maxAge: 6 * 3600) { self?.alert = Self.parseAlert(object) }
         }
     }
 
@@ -145,7 +190,8 @@ import simd
             let score = (final != nil ? 100 : 0) + (distance > 0 ? 50 : 0) + version
             let key = Int(gps.rounded())
             if let old = best[key], old.score >= score { continue }
-            best[key] = (score, Merger(name: name, m1: max(m1, m2), m2: min(m1, m2), final: final, distance: distance))
+            best[key] = (score, Merger(name: name, m1: max(m1, m2), m2: min(m1, m2), final: final, distance: distance, gps: gps,
+                                       redshift: number(e["redshift"]) ?? 0))
         }
         var list = best.values.map(\.merger).filter { $0.distance > 0 }
         // "GW250114_082203" reads as "GW250114" unless two events share a day.
@@ -179,351 +225,481 @@ import simd
         return text + "."
     }
 
-    /// Famous events in turn, each followed by one picked at random from the rest of the catalogue.
-    private func next(at time: Float) {
-        if order.isEmpty {
-            let famous = Self.famous.compactMap { name in events.firstIndex { $0.name == name } }
-            var rest = Array(events.indices).filter { !famous.contains($0) }.shuffled()
-            order = famous.flatMap { f -> [Int] in rest.isEmpty ? [f] : [f, rest.removeLast()] }
-            if order.isEmpty { order = Array(events.indices) }
-            shown = (Snapshot.variant ?? 0) % max(order.count, 1)
-        } else {
-            shown = (shown + 1) % order.count
+    /// The orbit in the detectors' frame: masses redshifted by (1 + z), so the slowed chirp keeps time with the data.
+    /// Heavier binaries chirp for less time, so the shown inspiral covers about the last 0.6 s of the recording.
+    private static func inspiral(for m: Merger) -> Inspiral {
+        let z = 1 + m.redshift
+        var i = Inspiral(m1: m.m1 * z, m2: m.m2 * z)
+        i.duration = min(max(i.stretch * 0.6, 14), 30)
+        return i
+    }
+
+    /// Downloads and processes one event's strain, one event at a time.
+    private func fetch(_ index: Int) {
+        guard loading == nil, signalFor != index, !failed.contains(index) else { return }
+        loading = index
+        Task { @MainActor [weak self] in
+            let result = await GWData.load(GWData.sources[index])
+            guard let self else { return }
+            loading = nil
+            if let result {
+                pending = (index, result)
+            } else {
+                failed.insert(index)
+            }
+            if index == order[0] { firstDone = true }
         }
-        current = events[order[shown]]
-        inspiral = Inspiral(m1: current.m1, m2: current.m2)
+    }
+
+    /// The most recently downloaded event, waiting for its turn.
+    private var pending: (Int, GWSignal)?
+
+    /// Starts the next event in the rotation.
+    private func next(at time: Float, _ f: Frame) {
+        if started { shown = (shown + 1) % order.count }
+        started = true
+        let index = order[shown]
+        let remembered = Self.remembered[index]
+        current = catalogue.first { abs($0.gps - remembered.gps) < 1 }.map { var m = $0; m.name = remembered.name; return m } ?? remembered
+        if current.redshift == 0 { current.redshift = remembered.redshift }
+        inspiral = Self.inspiral(for: current)
         eventStart = time
         chirped = false
         merged = false
         captioned = false
-    }
-
-    private var radiated: Double? {
-        guard let f = current.final else { return nil }
-        let r = current.m1 + current.m2 - f
-        return r >= 0.1 && current.m2 > 3 ? r : nil
-    }
-
-    private static func kind(_ m: Double) -> String { m < 3 ? "neutron star" : "black hole" }
-
-    private static func mass(_ m: Double) -> String { SpaceKit.number(m, decimals: m < 3 ? 2 : 1) }
-
-    private func describe() -> String {
-        let c = current
-        var text = "\(c.name): "
-        if Self.kind(c.m1) == Self.kind(c.m2) {
-            text += "\(Self.kind(c.m1))s of \(Self.mass(c.m1)) and \(Self.mass(c.m2)) solar masses"
-        } else {
-            text += "a \(Self.kind(c.m1)) of \(Self.mass(c.m1)) and a \(Self.kind(c.m2)) of \(Self.mass(c.m2)) solar masses"
+        if let (i, s) = pending, i == index {
+            signal = s
+            signalFor = i
+            pending = nil
+        } else if signalFor != index {
+            signal = nil
+            signalFor = nil
         }
-        let ly = c.distance * 3.2616e6
-        let far = ly >= 1e9 ? "\(SpaceKit.number(ly / 1e9, decimals: 1)) billion" : "\(Int((ly / 1e6).rounded())) million"
-        text += ", \(SpaceKit.number(c.distance)) megaparsecs, about \(far) light-years away"
-        if let r = radiated { text += "; about \(SpaceKit.number(r, decimals: 1)) solar masses became gravitational waves" }
-        text += ". Slowed \(SpaceKit.number(inspiral.stretch)) times."
-        if offline { text += " Offline, so showing three famous events from memory." }
-        if let alert, shown % 3 == 2 { text += " " + alert }
-        return text
+        let w = min(max(inspiral.duration / inspiral.stretch, 0.3), 0.6)
+        window = (-w, 0.12)
+        prepareFigure(f)
+        fetch(order[(shown + 1) % order.count])
     }
 
     // MARK: Drawing
 
     func draw(_ f: Frame) {
+        if !started { next(at: f.time, f) }
         let total = Float(inspiral.merger + 12) + 1.5
-        if f.time - eventStart > total { next(at: f.time) }
+        if f.time - eventStart > total { next(at: f.time, f) }
+        // A late download for the event on screen joins it while the inspiral is still young.
+        if signal == nil, let (i, s) = pending, i == order[shown], f.time - eventStart < 6 {
+            signal = s
+            signalFor = i
+            pending = nil
+            prepareFigure(f)
+            captioned = false
+        }
         let e = Double(f.time - eventStart)
         let s = e - 1.5
         let fade = Float(min(e / 1.5, 1, (Double(total) - e) / 1.5))
         let st = inspiral.state(s)
 
-        // Bodies: positions about the centre of mass, sizes from mass (neutron stars are bigger than their mass suggests).
+        // Positions in units of the total mass, about the centre of mass; the innermost stable orbit is 6 M across.
         let M = current.m1 + current.m2
-        let rISCO = 0.16
-        let r = rISCO * st.separation
+        let q1 = current.m1 / M, q2 = current.m2 / M
+        let r = 6 * st.separation
         let dir = SIMD2(cos(st.phase), sin(st.phase))
-        let p1 = dir * r * current.m2 / M, p2 = -dir * r * current.m1 / M
-        func radius(_ m: Double) -> Float { m < 3 ? 0.034 : Float(0.068 * pow(m / M, 0.6)) }
-        let gone = s >= inspiral.merger
-        let neutron = current.m2 < 3
-        let sinceMerger = Float(s - inspiral.merger)
-        let flash = sinceMerger > -0.3 ? exp(-pow(sinceMerger / 0.45, 2)) : 0
-        let remnant = Float(min(max((s - inspiral.merger + 0.15) / 0.3, 0), 1))
-        let kilonova: SIMD2<Float> = neutron && sinceMerger > 0 ? SIMD2(min(0.12 + 0.11 * sinceMerger, 0.6), 1.4 * exp(-sinceMerger / 3.5)) : .zero
-        let finalKind: Float = current.m1 < 3 && (current.final ?? M) < 3 ? 1 : 0
-        let p = Params(
-            body1: SIMD4(Float(p1.x), Float(p1.y), radius(current.m1), gone ? -1 : (current.m1 < 3 ? 1 : 0)),
-            body2: SIMD4(Float(p2.x), Float(p2.y), radius(current.m2), gone ? -1 : (current.m2 < 3 ? 1 : 0)),
-            remnant: SIMD4(current.m1 < 3 ? 0.042 : 0.075, remnant, finalKind, gone ? 1 : 0),
-            wave: SIMD4(Float(3.6 / window), Float(window), Float(samples), 0.032),
-            flash: SIMD4(flash, kilonova.x, kilonova.y, 0.2),
-            masses: SIMD4(gone ? 0 : Float(current.m1 / M), gone ? 0 : Float(current.m2 / M), fade, f.time.truncatingRemainder(dividingBy: 1000)))
+        let p1 = dir * r * q2, p2 = -dir * r * q1
+        // The common horizon forms over the last moments of the plunge.
+        let formed = Float(smoothstep(inspiral.merger - 0.22, inspiral.merger + 0.12, s))
+        let remnant = Float((current.final ?? 0.95 * M) / M)
 
-        // The wave's phase and amplitude over the last few seconds, read by the surface at each retarded time.
-        var history: [SIMD2<Float>] = []
-        history.reserveCapacity(samples)
-        for i in 0..<samples {
-            let h = inspiral.state(s - Double(i) * window / Double(samples - 1))
-            history.append(SIMD2(Float(h.phase), Float(h.amplitude)))
-        }
-
-        // A slow orbit of the camera, leaning in a little at the merger.
+        // A slow drift of the camera around the binary, and a different stretch of the Milky Way behind each event.
         let t = Double(f.time) + Double(f.seed) * 40
-        let yaw = t * 2 * .pi / 150
-        let elevation = Astro.rad(30 + 8 * sin(t * 0.021))
-        let distance = 2.0 - 0.2 * Double(flash)
-        // The view's centre wanders a little, so the merger never lands on the same pixels for hours.
-        let aim = SIMD3(0.12 * sin(t * 0.0029), 0.1 * sin(t * 0.0037 + 2), 0)
-        let eye = aim + SIMD3(cos(elevation) * cos(yaw), cos(elevation) * sin(yaw), sin(elevation)) * distance
-        let forward = simd_normalize(aim - eye)
-        let right = simd_normalize(simd_cross(forward, SIMD3(0, 0, 1)))
+        let yaw = t * 2 * .pi / 420
+        let tilt = Astro.rad(64 + 9 * sin(t * 0.013))
+        let distance = 26.0
+        let eye = SIMD3(sin(tilt) * cos(yaw), sin(tilt) * sin(yaw), cos(tilt)) * distance
+        let up0 = SIMD3<Double>(0, 0, 1)
+        let forward0 = simd_normalize(-eye)
+        let right0 = simd_normalize(simd_cross(forward0, up0))
+        let upAxis = simd_cross(right0, forward0)
+        // Aim a little below the binary so it sits above the middle of the screen.
+        let target = -upAxis * 4.6
+        let forward = simd_normalize(target - eye)
+        let right = simd_normalize(simd_cross(forward, up0))
         let up = simd_cross(right, forward)
+        let sky = skyTurn(e, right: right, up: up, forward: forward)
+
+        let figure = figureBox()
         let f3 = { (v: SIMD3<Double>) in SIMD3<Float>(Float(v.x), Float(v.y), Float(v.z)) }
-        let view = f.uniforms(SIMD4(f3(eye), 1.7), SIMD4(f3(right), 0), SIMD4(f3(up), 0), SIMD4(f3(forward), f.size.y / 750))
+        let params = LensParams(
+            hole1: SIMD4(Float(p1.x), Float(p1.y), 0, Float(q1) * (1 - formed)),
+            hole2: SIMD4(Float(p2.x), Float(p2.y), 0, Float(q2) * (1 - formed)),
+            hole3: SIMD4(0, 0, 0, remnant * formed),
+            eye: SIMD4(f3(eye), 1.35), right: SIMD4(f3(right), fade), up: SIMD4(f3(up), 1.5),
+            forward: SIMD4(f3(forward), photo == nil ? 1 : 0),
+            sky0: SIMD4(f3(sky[0]), 0), sky1: SIMD4(f3(sky[1]), 0), sky2: SIMD4(f3(sky[2]), 0),
+            scrim: SIMD4(Float(figure.minX) - 0.03, Float(figure.minY) - 0.05, Float(figure.maxX) + 0.03, Float(figure.maxY) + 0.03))
 
         if light?.width != f.target.width || light?.height != f.target.height {
             light = f.gpu.texture(f.target.width, f.target.height)
         }
         let light = light!
-        let params = rings[0].next(p)
-        let hist = rings[1].next(history)
-        f.cmd.draw(surface, into: light, uniforms: view, buffers: [params, hist])
-        // The strain trace, newest on the right; it drifts a few pixels over the hours so it never burns in.
-        let drift = Float(sin(Double(f.time) * 0.0013)) * 0.008
-        f.cmd.draw(tracePipe, into: light, clear: false, uniforms: f.uniforms(SIMD4(fade, drift, 0, 0), view.b, view.c, view.d),
-                   buffers: [hist], vertices: 4, instances: samples, primitive: .triangleStrip)
-        let glow = bloom.glow(f.cmd, light)
-        f.cmd.draw(tonePipe, into: f.target, uniforms: f.uniforms(), textures: [light, glow])
+        f.cmd.draw(lensPipe, into: light, uniforms: f.uniforms(), textures: [photo ?? outline, outline],
+                   buffers: [rings[0].next(params), deflection])
+        lens.develop(f, light, Lens.Look(exposure: 1, bloom: 0.035, halation: 0.02, vignette: 0.3, aberration: 1.0, grain: 0.45))
+        drawFigure(f, s: s, fade: fade, box: figure)
 
         if !captioned {
             captioned = true
-            caption(f)
+            caption(f, box: figure)
         }
-        if let synth = f.sound { play(synth, s, st.amplitude) }
+        if let synth = f.sound { play(synth, s) }
     }
 
-    private func caption(_ f: Frame) {
+    /// Rows of the rotation taking scene directions to equatorial ones: the camera's view lands on this event's
+    /// stretch of the Milky Way, wandering a few degrees along it, the band tilted across the frame.
+    private func skyTurn(_ e: Double, right: SIMD3<Double>, up: SIMD3<Double>, forward: SIMD3<Double>) -> [SIMD3<Double>] {
+        let base = Self.backdrops[shown % Self.backdrops.count]
+        let l = Astro.rad(base.x + 5 * sin(e * 0.02)), b = Astro.rad(base.y + 1.5 * sin(e * 0.031))
+        let target = SpaceSky.equatorial(galactic: SIMD3(cos(b) * cos(l), cos(b) * sin(l), sin(b)))
+        let pole = SpaceSky.equatorial(galactic: SIMD3(0, 0, 1))
+        let roll = Astro.rad(shown % 2 == 0 ? 24 : -18)
+        let r0 = simd_normalize(simd_cross(target, pole))
+        let u0 = simd_cross(r0, target)
+        let rightE = r0 * cos(roll) + u0 * sin(roll), upE = u0 * cos(roll) - r0 * sin(roll)
+        // R = [rightE upE target] · [right up forward]ᵀ, stored as rows.
+        func column(_ v: SIMD3<Double>) -> SIMD3<Double> { rightE * v.x + upE * v.y + target * v.z }
+        let cx = column(SIMD3(right.x, up.x, forward.x)), cy = column(SIMD3(right.y, up.y, forward.y))
+        let cz = column(SIMD3(right.z, up.z, forward.z))
+        return [SIMD3(cx.x, cy.x, cz.x), SIMD3(cx.y, cy.y, cz.y), SIMD3(cx.z, cy.z, cz.z)]
+    }
+
+    // MARK: The figure
+
+    /// The figure's box in uv (0...1, top left origin): the strain above, the time–frequency map below. It changes
+    /// sides from one event to the next so nothing sits on the same pixels for hours.
+    private func figureBox() -> CGRect {
+        let x = shown % 2 == 0 ? 0.05 : 0.6
+        return CGRect(x: x, y: 0.69, width: 0.35, height: 0.235)
+    }
+
+    private func prepareFigure(_ f: Frame) {
+        guard let signal else { map = nil; traces = nil; return }
+        // The time–frequency map over the window, 480 columns.
+        let columns = 480
+        var pixels = [Float](repeating: 0, count: columns * GWSignal.rows)
+        for row in 0..<GWSignal.rows {
+            for c in 0..<columns {
+                let t = window.start + (window.end - window.start) * (Double(c) + 0.5) / Double(columns)
+                pixels[(GWSignal.rows - 1 - row) * columns + c] = signal.energy(row: row, at: t)
+            }
+        }
+        map = pixels.withUnsafeBytes { f.gpu.texture(columns, GWSignal.rows, .r32Float, bytes: $0.baseAddress!, bytesPerRow: columns * 4) }
+        // Both traces over the window, as (time, Hanford, Livingston, 0).
+        var points: [SIMD4<Float>] = []
+        var peak: Float = 0
+        let i0 = Int((window.start + GWSignal.before) * GWSignal.rate), i1 = Int((window.end + GWSignal.before) * GWSignal.rate)
+        for i in max(i0, 0)..<min(i1, signal.hanford.count) {
+            let t = Double(i) / GWSignal.rate - GWSignal.before
+            points.append(SIMD4(Float(t), signal.hanford[i], signal.livingston[i], 0))
+            peak = max(peak, abs(signal.hanford[i]), abs(signal.livingston[i]))
+        }
+        range = max(peak * 1.12, 5)
+        traceCount = points.count
+        traces = f.gpu.buffer(points)
+    }
+
+    private func drawFigure(_ f: Frame, s: Double, fade: Float, box: CGRect) {
+        guard let traces, let map, traceCount > 1 else { return }
+        let now = Float((s - inspiral.merger) / inspiral.stretch)
+        let u = f.uniforms(SIMD4(Float(box.minX), Float(box.minY), Float(box.width), Float(box.height)),
+                           SIMD4(Float(window.start), Float(window.end), now, fade),
+                           SIMD4(range, f.size.y / 1000, 0, 0), SIMD4(Float(traceCount - 1), 0, 0, 0))
+        f.cmd.draw(mapPipe, into: f.target, clear: false, uniforms: u, textures: [map], vertices: 4, primitive: .triangleStrip)
+        // Livingston under Hanford, then the zero line and the playhead.
+        f.cmd.draw(tracePipe, into: f.target, clear: false, uniforms: u, buffers: [traces],
+                   vertices: 4, instances: 2 * (traceCount - 1) + 2, primitive: .triangleStrip)
+    }
+
+    private func caption(_ f: Frame, box: CGRect) {
         let c = current
-        let both = "\(Self.mass(c.m1)) + \(Self.mass(c.m2)) solar masses"
-        let result = c.final.map { " → \(SpaceKit.number($0, decimals: 1))" } ?? ""
+        let both = "\(Self.mass(c.m1)) + \(Self.mass(c.m2)) M☉" + (c.final.map { " → \(SpaceKit.number($0, decimals: 1)) M☉" } ?? "")
         let ly = c.distance * 3.2616e6
         let far = ly >= 1e9 ? "\(SpaceKit.number(ly / 1e9, decimals: 1)) billion light-years" : "\(Int((ly / 1e6).rounded())) million light-years"
-        let radiated = radiated
+        let signal = signal
+        let window = window
         let stretch = SpaceKit.number(inspiral.stretch)
+        let date = Self.date(gps: signal?.gps ?? c.gps)
         f.overlay.draw { ctx, size in
-            ctx.text(c.name, at: CGPoint(x: 30, y: 26), size: 24, weight: .ultraLight, color: NSColor(white: 1, alpha: 0.8), tracking: 1.5)
-            ctx.text(both + result, at: CGPoint(x: 31, y: 60), size: 12.5, weight: .regular, color: NSColor(white: 1, alpha: 0.55))
-            ctx.text("\(SpaceKit.number(c.distance)) megaparsecs · \(far)", at: CGPoint(x: 31, y: 79), size: 12.5,
-                     color: NSColor(white: 1, alpha: 0.42))
-            if let radiated {
-                ctx.text("\(SpaceKit.number(radiated, decimals: 1)) solar masses radiated as gravitational waves", at: CGPoint(x: 31, y: 98),
-                         size: 12.5, color: NSColor(white: 1, alpha: 0.42))
+            let x = box.minX * size.width, w = box.width * size.width
+            let y = box.minY * size.height, h = box.height * size.height
+            let strainBottom = y + h * 0.47, mapTop = y + h * 0.53
+            let dim = NSColor(white: 1, alpha: 0.38), faint = NSColor(white: 1, alpha: 0.24)
+            ctx.text(c.name, at: CGPoint(x: x - 1, y: y - 74), size: 21, weight: .ultraLight, color: NSColor(white: 1, alpha: 0.78), tracking: 1.2)
+            ctx.text("\(both)  ·  \(SpaceKit.number(c.distance)) Mpc, \(far)", at: CGPoint(x: x, y: y - 46), size: 10.5,
+                     color: NSColor(white: 1, alpha: 0.5))
+            ctx.text(date + "  ·  orbit slowed \(stretch)×", at: CGPoint(x: x, y: y - 31), size: 10.5, color: dim)
+            guard let signal else {
+                ctx.text("LIGO strain not downloaded  ·  model chirp", at: CGPoint(x: x, y: y + 4), size: 9.5, weight: .medium,
+                         color: faint, tracking: 1.0)
+                return
             }
-            ctx.text("STRAIN  ·  SLOWED \(stretch)×", at: CGPoint(x: size.width * 0.06, y: size.height * 0.815), size: 9.5,
-                     weight: .medium, color: NSColor(red: 1, green: 0.7, blue: 0.4, alpha: 0.55), tracking: 1.6)
+            let hanford = NSColor(red: 1.0, green: 0.74, blue: 0.5, alpha: 0.62)
+            let livingston = NSColor(red: 0.62, green: 0.78, blue: 1.0, alpha: 0.62)
+            ctx.text("HANFORD H1", at: CGPoint(x: x, y: y - 14), size: 8.5, weight: .medium, color: hanford, tracking: 1.2)
+            let flip = signal.flipped ? ", inverted" : ""
+            ctx.text("LIVINGSTON L1  (shifted \(SpaceKit.number(abs(signal.lag), decimals: 1)) ms\(flip))", at: CGPoint(x: x + 82, y: y - 14),
+                     size: 8.5, weight: .medium, color: livingston, tracking: 1.2)
+            ctx.text("WHITENED STRAIN (σ)  ·  30–400 Hz", at: CGPoint(x: x + w, y: y - 14), size: 8, weight: .regular, color: faint,
+                     anchor: CGPoint(x: 1, y: 0), tracking: 0.8)
+            // Hairlines: the strain panel's frame ticks and the time axis under the map.
+            ctx.setLineWidth(0.6)
+            ctx.setStrokeColor(NSColor(white: 1, alpha: 0.16).cgColor)
+            ctx.stroke(CGRect(x: x, y: y, width: w, height: strainBottom - y))
+            ctx.stroke(CGRect(x: x, y: mapTop, width: w, height: y + h - mapTop))
+            let span = window.end - window.start
+            var tick = (window.start / 0.1).rounded(.up) * 0.1
+            while tick <= window.end + 1e-6 {
+                let tx = x + w * (tick - window.start) / span
+                ctx.move(to: CGPoint(x: tx, y: y + h))
+                ctx.addLine(to: CGPoint(x: tx, y: y + h + 4))
+                let label = abs(tick) < 1e-6 ? "0 s" : String(format: "%+.1f", tick).replacingOccurrences(of: "-", with: "−")
+                ctx.text(label, at: CGPoint(x: tx, y: y + h + 6), size: 8.5, color: faint, anchor: CGPoint(x: 0.5, y: 0))
+                tick += 0.1
+            }
+            ctx.strokePath()
+            ctx.text("TIME FROM MERGER", at: CGPoint(x: x + w, y: y + h + 18), size: 8, color: faint, anchor: CGPoint(x: 1, y: 0), tracking: 0.8)
+            // Frequency ticks on the map, log scale.
+            for hz in [32.0, 64, 128, 256] {
+                let row = log(hz / GWSignal.low) / log(GWSignal.high / GWSignal.low)
+                let ty = y + h - (y + h - mapTop) * row
+                ctx.move(to: CGPoint(x: x - 4, y: ty))
+                ctx.addLine(to: CGPoint(x: x, y: ty))
+                ctx.text("\(Int(hz))", at: CGPoint(x: x - 6, y: ty), size: 8, color: faint, anchor: CGPoint(x: 1, y: 0.5))
+            }
+            ctx.strokePath()
+            ctx.text("Hz", at: CGPoint(x: x - 6, y: mapTop - 2), size: 8, color: faint, anchor: CGPoint(x: 1, y: 0))
         }
+    }
+
+    /// The UTC date of a GPS time (18 leap seconds since 1980 by 2017; close enough for a date).
+    private static func date(gps: Double) -> String {
+        let unix = gps + 315_964_800 - 18
+        let d = Date(timeIntervalSince1970: unix)
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "d MMMM yyyy, HH:mm:ss 'UTC'"
+        return f.string(from: d)
+    }
+
+    private var radiated: Double? {
+        guard let f = current.final else { return nil }
+        let r = current.m1 + current.m2 - f
+        return r >= 0.1 ? r : nil
+    }
+
+    private static func mass(_ m: Double) -> String { SpaceKit.number(m, decimals: m < 3 ? 2 : 1) }
+
+    private func describe() -> String {
+        let c = current
+        var text = "\(c.name): black holes of \(Self.mass(c.m1)) and \(Self.mass(c.m2)) solar masses"
+        let ly = c.distance * 3.2616e6
+        let far = ly >= 1e9 ? "\(SpaceKit.number(ly / 1e9, decimals: 1)) billion" : "\(Int((ly / 1e6).rounded())) million"
+        text += ", about \(far) light-years away"
+        if let r = radiated { text += "; about \(SpaceKit.number(r, decimals: 1)) solar masses became gravitational waves" }
+        text += ". "
+        if let signal {
+            text += "Real strain from LIGO Hanford and Livingston, \(SpaceKit.number(abs(signal.lag), decimals: 1)) milliseconds apart; "
+            text += "the orbit and the sound are slowed \(SpaceKit.number(inspiral.stretch)) times."
+        } else if loading == order[shown] {
+            text += "Downloading the LIGO strain; meanwhile a model chirp from the masses."
+        } else {
+            text += "The LIGO strain hasn't downloaded, so the sound is a model chirp from the masses."
+        }
+        if detections > 0, shown % 3 == 1 { text += " One of \(SpaceKit.number(Double(detections))) mergers in the open catalogue." }
+        if let alert, shown % 3 == 2 { text += " " + alert }
+        return text
     }
 
     // MARK: Sound
 
-    /// The chirp from the real masses: its final pitch follows the frequency at the innermost stable orbit
-    /// (about 4,400 Hz × M☉ / M), squeezed into a pleasant range so heavier mergers still sound lower.
-    private func play(_ synth: Synth, _ s: Double, _ amplitude: Double) {
-        let M = current.m1 + current.m2
-        let end = Float(min(max(330 * pow(66 / M, 0.35), 160), 1100))
-        if !chirped, s >= 0 {
-            chirped = true
-            let start = end * Float(pow(inspiral.tauISCO / inspiral.tauStart, 0.375))
-            synth.play(.chirp, start, amp: 0.16 * min(1, sqrt(400 / end)), length: Float(inspiral.tauStart), to: end)
+    /// The real data as a chord: each of eight frequency bands from 24 to 480 Hz is one note, as loud as the strain's
+    /// energy in that band at the playhead, panned toward whichever detector heard more. The noise is a soft shimmer;
+    /// the chirp climbs through the chord as it rises in frequency, then the remnant rings.
+    private func play(_ synth: Synth, _ s: Double) {
+        let now = (s - inspiral.merger) / inspiral.stretch
+        if let signal {
+            for band in 0..<8 {
+                var h: Float = 0, l: Float = 0
+                for row in (band * 8)..<(band * 8 + 8) {
+                    h += signal.energy(row: row, at: now, detector: 0)
+                    l += signal.energy(row: row, at: now, detector: 1)
+                }
+                h /= 8
+                l /= 8
+                let e = 0.5 * (h + l)
+                let shimmer = 0.009 * min(e / 3, 1)
+                let rise = 0.075 * pow(min(max((e - 2) / 18, 0), 1), 0.8)
+                synth.drone(band, Self.chord[band], s < -1 ? 0 : shimmer + rise, pan: (l - h) / (l + h + 0.5) * 0.7)
+            }
+        } else {
+            // A model chirp from the masses while the data is missing.
+            if !chirped, s >= 0 {
+                chirped = true
+                let end: Float = 330
+                let start = end * Float(pow(inspiral.tauISCO / inspiral.tauStart, 0.375))
+                synth.play(.chirp, start, amp: 0.12, length: Float(inspiral.tauStart), to: end)
+            }
+            for band in 0..<8 { synth.drone(band, Self.chord[band], band % 3 == 0 ? 0.008 : 0) }
         }
         if !merged, s >= inspiral.merger {
             merged = true
-            synth.play(.thump, 48, amp: 0.16, length: 2.5)
-            synth.play(.bell, end * 1.5, amp: 0.05, length: 4)
+            synth.play(.thump, 46, amp: 0.12, length: 2.5)
+            synth.play(.bell, 440, amp: 0.035, length: 5)
         }
-        let swell = Float(min(amplitude, 1.5)) * 0.02
-        synth.drone(0, 55, 0.05 + swell)
-        synth.drone(1, 82.4, 0.03 + swell)
-        synth.drone(2, 110, 0.015)
-        synth.noise(0.015, cutoff: 140)
+        synth.noise(0.01, cutoff: 150)
     }
 
     // MARK: Shaders
 
     private static let source = """
-    struct GW {
-        float4 body1;    // xy, radius, kind (0 black hole, 1 neutron star, -1 gone)
-        float4 body2;
-        float4 remnant;  // radius, visibility, kind, whether its well has formed
-        float4 wave;     // speed, window seconds, samples, amplitude
-        float4 flash;    // merger flash, kilonova radius, kilonova brightness, well depth
-        float4 masses;   // mass shares, fade, time
+    struct GWLens {
+        float4 hole1, hole2, hole3;   // position in total masses, mass
+        float4 eye;                   // position, focal length
+        float4 right;                 // axis, fade
+        float4 up;                    // axis, exposure
+        float4 fwd;                   // axis, no photograph
+        float4 sky0, sky1, sky2;      // scene → equatorial rows
+        float4 scrim;                 // figure box in uv
     };
 
-    inline float2 waveAt(const device float2 *h, float r, constant GW &g) {
-        float i = clamp(r / g.wave.x / g.wave.y * (g.wave.z - 1), 0.0, g.wave.z - 1.001);
-        uint k = uint(i);
-        return mix(h[k], h[k + 1], i - float(k));
+    // Exact Schwarzschild bending for impact parameter b past mass m: the table covers b = √27 m (1 + s) for
+    // s = 10⁻⁶...10²; outside it, the strong-deflection limit and the weak-field series.
+    inline float bendAngle(float b, float m, const device float *table) {
+        float s = b / (5.1961524 * m) - 1;
+        if (s >= 100) { float x = m / b; return 4 * x + 11.780972 * x * x; }
+        if (s <= 1e-6) return -log(max(s, 1e-30)) - 0.40023;
+        float i = (log10(s) + 6) / 8 * 255;
+        int k = min(int(i), 254);
+        return mix(table[k], table[k + 1], i - float(k));
     }
 
-    // Height of the rubber sheet: a well under each mass, plus the outgoing wave h+ = A(t - r/c) cos(2φ - 2Φ(t - r/c)).
-    inline float sheet(float2 q, constant GW &g, const device float2 *h, thread float &strain) {
-        float depth = g.flash.w;
-        float well = 0;
-        well -= depth * g.masses.x / sqrt(1 + dot(q - g.body1.xy, q - g.body1.xy) / 0.03);
-        well -= depth * g.masses.y / sqrt(1 + dot(q - g.body2.xy, q - g.body2.xy) / 0.03);
-        well -= depth * g.remnant.w / sqrt(1 + dot(q, q) / 0.03);
-        float r = length(q);
-        float2 s = waveAt(h, r, g);
-        float phi = atan2(q.y, q.x);
-        strain = s.y * cos(2 * phi - 2 * s.x) * smoothstep(0.08, 0.35, r);
-        return well + strain * g.wave.w * smoothstep(0.12, 0.7, r) / (0.4 + r) * smoothstep(4.2, 2.8, r);
+    // ESO's photograph toward equatorial direction d, filtered along the pixel's footprint on the sky: lensing stretches
+    // that footprint into long thin arcs, and anisotropic filtering keeps them sharp across and smooth along. Jupiter,
+    // caught in the photograph in 2009, is painted over as in `milkyWay`.
+    inline float3 lensedSky(texture2d<float> t, float3 d) {
+        constexpr sampler s(filter::linear, mip_filter::linear, s_address::repeat, t_address::clamp_to_edge, max_anisotropy(16));
+        float3 g = EQ_TO_PHOTO * d;
+        float2 uv = float2(0.5 - atan2(g.y, g.x) / TAU, 0.5 - asin(clamp(g.z, -1.0, 1.0)) / PI);
+        float2 dx = dfdx(uv), dy = dfdy(uv);
+        dx.x -= round(dx.x);
+        dy.x -= round(dy.x);
+        float3 c = t.sample(s, uv, gradient2d(dx, dy)).rgb;
+        float jupiter = smoothstep(0.99985, 0.99992, dot(g, float3(0.19237, 0.48919, -0.85068)));
+        if (jupiter > 0) c = mix(c, t.sample(s, uv - float2(0, 0.012), gradient2d(dx, dy)).rgb, jupiter);
+        return c;
     }
 
-    // Bends a ray passing a black hole like a point lens, by θE²/θ toward it, so the grid behind is lensed into a ring.
-    inline float3 bend(float3 ro, float3 rd, float3 c, float radius) {
-        float3 oc = c - ro;
-        float along = dot(oc, rd);
-        if (along <= 0 || radius <= 0) return rd;
-        float3 perp = oc - rd * along;
-        float b = length(perp);
-        float theta = b / along, edge = radius / along;
-        if (theta < edge) return rd;   // into the shadow: nothing comes back
-        float alpha = (1.4 * edge) * (1.4 * edge) / max(theta, edge * 0.7);
-        return normalize(rd + perp / max(b, 1e-6) * alpha);
-    }
-
-    inline float3 bodyCenter(float4 b, constant GW &g, const device float2 *h) {
-        float s;
-        return float3(b.xy, sheet(b.xy, g, h, s) + b.z * 1.1);
-    }
-
-    // Lays a black hole (a shadow ringed by a thin photon ring) or a neutron star (hot and bright) over `col`,
-    // unless the sheet is in front of it. `hitT` is how far along the ray the sheet is.
-    inline float3 shadeBody(float3 col, float3 ro, float3 rd, float3 c, float radius, float kind, float hitT) {
-        float3 oc = c - ro;
-        float along = dot(oc, rd);
-        if (along <= 0 || radius <= 0) return col;
-        float b = length(oc - rd * along);
-        float entry = along - sqrt(max(radius * radius - b * b, 0.0));
-        bool visible = entry < hitT + radius;
-        float px = 0.004 * length(oc);
-        if (kind < 0.5) {
-            float shadow = visible ? smoothstep(radius + px, radius - px, b) : 0.0;
-            float ring = exp(-pow((b - radius * 1.08) / (radius * 0.04 + px), 2.0)) * 0.9 + exp(-max(b - radius, 0.0) / (radius * 0.5)) * 0.08;
-            float shown = along - radius < hitT ? 1.0 : 0.25;
-            return col * (1 - shadow) + float3(0.6, 0.75, 1.0) * ring * (1 - shadow) * shown;
+    fragment float4 gwLensing(V in [[stage_in]], constant U &u [[buffer(0)]], constant GWLens &g [[buffer(1)]],
+                              const device float *table [[buffer(2)]], texture2d<float> photo [[texture(0)]],
+                              texture2d<float> outline [[texture(1)]]) {
+        float2 p = centered(in.uv, u.res);
+        float3 rd = normalize(g.fwd.xyz * g.eye.w + p.x * g.right.xyz + p.y * g.up.xyz);
+        float3 ro = g.eye.xyz;
+        float pixel = 2 / (u.res.y * g.eye.w);
+        float4 holes[3] = { g.hole1, g.hole2, g.hole3 };
+        // The holes sit within a few masses of each other, far closer than the camera, so their bending adds as in a
+        // thin lens: each turns the ray toward itself by its exact Schwarzschild angle, summed as rotations.
+        float3 turn = 0;
+        float shadow = 0;
+        for (int k = 0; k < 3; k++) {
+            float4 h = holes[k];
+            float m = h.w;
+            float3 oc = h.xyz - ro;
+            float along = dot(oc, rd);
+            if (m <= 1e-4 || along <= 0) continue;
+            float3 perp = oc - rd * along;
+            float b = max(length(perp), 1e-6);
+            float bc = 5.1961524 * m;
+            float px = along * pixel;
+            shadow = max(shadow, smoothstep(bc + 0.8 * px, bc - 0.8 * px, b));
+            turn += cross(rd, perp / b) * bendAngle(max(b, bc * 1.000001), m, table);
         }
-        float core = visible ? smoothstep(radius + px, radius - px, b) : 0.0;
-        float mu = sqrt(max(1 - b * b / (radius * radius), 0.0));
-        float3 hot = float3(0.62, 0.8, 1.0) * (0.9 + 0.6 * (1 - mu));
-        float halo = exp(-max(b - radius, 0.0) / (radius * 0.7)) * 0.3 * (along - radius < hitT ? 1.0 : 0.3);
-        return mix(col, hot, core) + float3(0.5, 0.7, 1.0) * halo * (1 - core);
+        float angle = length(turn);
+        if (angle > 1e-6) rd = normalize(rd * cos(angle) + cross(turn / angle, rd) * sin(angle));
+        float3 d = float3(dot(g.sky0.xyz, rd), dot(g.sky1.xyz, rd), dot(g.sky2.xyz, rd));
+        float3 col = g.fwd.w > 0.5 ? milkyWayOutline(outline, d) : lensedSky(photo, d);
+        col *= g.up.w * (1 - shadow);
+        // A soft darkening behind the figure, like a graduated filter, so its hairlines read over the star clouds.
+        float2 q = in.uv;
+        float inside = smoothstep(g.scrim.x - 0.07, g.scrim.x + 0.03, q.x) * smoothstep(g.scrim.z + 0.07, g.scrim.z - 0.03, q.x)
+                     * smoothstep(g.scrim.y - 0.1, g.scrim.y + 0.04, q.y);
+        col *= 1 - 0.62 * inside;
+        return float4(col * g.right.w, 1);
     }
 
-    fragment float4 spacetime(V in [[stage_in]], constant U &u [[buffer(0)]], constant GW &g [[buffer(1)]],
-                              const device float2 *h [[buffer(2)]]) {
-        float2 p = (in.uv * 2 - 1) * float2(u.res.x / u.res.y, -1);
-        float3 ro = u.a.xyz;
-        float3 rd = normalize(u.d.xyz + (p.x * u.b.xyz + p.y * u.c.xyz) / u.a.w);
-        float3 seen = rd;
-
-        float3 c1 = bodyCenter(g.body1, g, h), c2 = bodyCenter(g.body2, g, h);
-        float3 cr = float3(0, 0, -g.flash.w + g.remnant.x * 1.1);
-        if (g.body1.w == 0) rd = bend(ro, rd, c1, g.body1.z);
-        if (g.body2.w == 0) rd = bend(ro, rd, c2, g.body2.z);
-        if (g.remnant.z < 0.5) rd = bend(ro, rd, cr, g.remnant.x * g.remnant.y);
-
-        // Background: a few faint stars.
-        float3 col = float3(0.0015, 0.0018, 0.004);
-        float2 cell = floor(float2(atan2(rd.y, rd.x), asin(rd.z)) * 260.0);
-        float star = hash12(cell);
-        col += step(0.9975, star) * float3(0.5, 0.6, 0.8) * hash12(cell + 7.1) * 0.25;
-
-        // March to the displaced sheet: intersect the plane, then refine against the height a few times.
-        float3 surf = 0;
-        float hitT = 1e9;
-        if (rd.z < -0.02) {
-            float t = -ro.z / rd.z;
-            float strain = 0;
-            for (int i = 0; i < 6; i++) {
-                float2 q = (ro + rd * t).xy;
-                float z = sheet(q, g, h, strain);
-                t = mix(t, (z - ro.z) / rd.z, 0.75);
-            }
-            float3 pos = ro + rd * t;
-            float z = sheet(pos.xy, g, h, strain);
-            hitT = t;
-            float r = length(pos.xy);
-            // Fine grid lines, antialiased, every fifth one stronger.
-            float2 gq = pos.xy / 0.075;
-            float2 fw = fwidth(gq);
-            float2 lines = abs(fract(gq - 0.5) - 0.5) / max(fw, 1e-4);
-            // Lines fade out where they crowd closer than a few pixels, so the far sheet never shimmers.
-            float line = (1 - clamp(min(lines.x, lines.y) - 0.15, 0.0, 1.0)) * clamp(1.6 - max(fw.x, fw.y) * 4.0, 0.0, 1.0);
-            float2 gq5 = pos.xy / 0.375;
-            float2 fw5 = fwidth(gq5);
-            float2 lines5 = abs(fract(gq5 - 0.5) - 0.5) / max(fw5, 1e-4);
-            float major = (1 - clamp(min(lines5.x, lines5.y) - 0.3, 0.0, 1.0)) * clamp(1.6 - max(fw5.x, fw5.y) * 4.0, 0.0, 1.0);
-            float fade = exp(-max(t - 1.5, 0.0) / 2.2) * smoothstep(4.4, 2.6, r);
-            float lift = clamp(strain, -1.5, 1.5);
-            float3 crest = mix(float3(0.22, 0.32, 1.0), float3(0.55, 0.9, 1.0), clamp(lift * 0.6 + 0.5, 0.0, 1.0));
-            float3 lineColor = crest * (0.12 + 0.55 * abs(lift));
-            float well = clamp(-z / g.flash.w, 0.0, 1.0);
-            lineColor += float3(0.6, 0.4, 1.0) * well * 0.4;
-            surf = lineColor * (line * 0.5 + major * 0.45);
-            // The wave itself glows on the sheet: crests cyan, troughs violet, so the two-armed spiral shows.
-            float near = smoothstep(4.5, 2.2, t);
-            surf += (float3(0.05, 0.22, 0.4) * pow(max(lift, 0.0), 2.0) * 0.35 + float3(0.16, 0.05, 0.3) * pow(max(-lift, 0.0), 2.0) * 0.25) * near;
-            surf += float3(0.006, 0.008, 0.02);
-            // The merger flash lights the sheet near the centre.
-            surf += float3(0.9, 0.85, 1.0) * g.flash.x * exp(-r * r / 0.18) * 0.6;
-            surf *= fade;
-            col = mix(col, surf, fade);
-        }
-
-        // The bodies, nearest last.
-        bool firstNear = dot(c1 - ro, rd) < dot(c2 - ro, rd);
-        float4 far = firstNear ? g.body2 : g.body1, near = firstNear ? g.body1 : g.body2;
-        float3 cf = firstNear ? c2 : c1, cn = firstNear ? c1 : c2;
-        if (far.w >= 0) col = shadeBody(col, ro, seen, cf, far.z, far.w, hitT);
-        if (near.w >= 0) col = shadeBody(col, ro, seen, cn, near.z, near.w, hitT);
-        if (g.remnant.y > 0) col = shadeBody(col, ro, seen, cr, g.remnant.x * g.remnant.y, g.remnant.z, hitT);
-
-        // Merger flash and, for neutron stars, the kilonova's glowing red cloud.
-        float3 oc = float3(0, 0, -g.flash.w * 0.5) - ro;
-        float bc = length(oc - rd * dot(oc, rd));
-        col += float3(0.85, 0.9, 1.0) * g.flash.x * (exp(-bc * bc / 0.003) * 1.6 + exp(-bc / 0.22) * 0.25);
-        if (g.flash.z > 0) {
-            float k = g.flash.y;
-            float cloud = exp(-bc * bc / (k * k)) * (0.7 + 0.3 * fbm(rd.xy * 30.0 + g.masses.w * 0.05, 3));
-            col += float3(1.0, 0.42, 0.18) * cloud * g.flash.z * 0.5;
-        }
-        return float4(col * g.masses.z, 1);
+    // a: figure box (x, y, w, h in uv)   b: window start, end, playhead (s), fade   c: strain range (σ), pixel density.
+    // The strain panel is the box's top 47 %, the map its bottom 47 %.
+    inline float2 strainPoint(float t, float v, constant U &u) {
+        float x = u.a.x + u.a.z * (t - u.b.x) / (u.b.y - u.b.x);
+        float y = u.a.y + u.a.w * 0.235 * (1 - v / u.c.x);
+        return float2(x, y) * u.res;
     }
 
-    // The strain trace along the bottom, from the same history: buffer 1 holds (phase, amplitude) newest first.
-    // Instance 511 draws the faint zero line.
-    vertex LineOut strainVertex(uint vid [[vertex_id]], uint iid [[instance_id]], constant U &u [[buffer(0)]],
-                                const device float2 *h [[buffer(1)]]) {
-        float x0 = 0.06 * u.res.x, x1 = 0.94 * u.res.x;
-        float y = (0.9 + u.a.y) * u.res.y, amp = 0.045 * u.res.y;
-        float d = u.d.w;
-        if (iid >= 511) {
-            return lineQuad(float2(x0, y), float2(x1, y), 0.8 * d, float4(1.0, 0.6, 0.3, 0) * 0.05 * u.a.x, vid, u.res);
+    // Instances: Livingston's segments, Hanford's, then the zero line and the playhead.
+    vertex LineOut gwTraceVertex(uint vid [[vertex_id]], uint iid [[instance_id]], constant U &u [[buffer(0)]],
+                                 const device float4 *pts [[buffer(1)]]) {
+        uint segs = (uint(u.d.x) > 0 ? uint(u.d.x) : 0);
+        float d = u.c.y;
+        float fade = u.b.w;
+        uint count = segs;
+        LineOut o;
+        if (iid < 2 * count) {
+            bool hanford = iid >= count;
+            uint i = iid % count;
+            float4 a = pts[i], b = pts[i + 1];
+            float va = hanford ? a.y : a.z, vb = hanford ? b.y : b.z;
+            float past = a.x <= u.b.z ? 1.0 : 0.22;
+            float3 tint = hanford ? float3(1.0, 0.74, 0.5) : float3(0.62, 0.78, 1.0);
+            float alpha = (hanford ? 0.72 : 0.58) * past * fade;
+            return lineQuad(strainPoint(a.x, va, u), strainPoint(b.x, vb, u), 1.0 * d, float4(tint * alpha, alpha), vid, u.res);
         }
-        float2 a = h[iid], b = h[iid + 1];
-        float ya = y - amp * a.y * cos(2 * a.x) / 1.4, yb = y - amp * b.y * cos(2 * b.x) / 1.4;
-        float xa = mix(x1, x0, float(iid) / 511.0), xb = mix(x1, x0, float(iid + 1) / 511.0);
-        float age = float(iid) / 511.0;
-        float4 color = float4(1.0, 0.62, 0.28, 0) * (0.5 * (1 - age * 0.6)) * u.a.x;
-        return lineQuad(float2(xa, ya), float2(xb, yb), 1.3 * d, color, vid, u.res);
+        if (iid == 2 * count) {
+            return lineQuad(strainPoint(u.b.x, 0, u), strainPoint(u.b.y, 0, u), 0.6 * d, float4(0.12, 0.12, 0.12, 0.12) * fade, vid, u.res);
+        }
+        float shown = (u.b.z > u.b.x && u.b.z < u.b.y) ? 1.0 : 0.0;
+        float x = strainPoint(clamp(u.b.z, u.b.x, u.b.y), 0, u).x;
+        float a = 0.32 * shown * fade;
+        return lineQuad(float2(x, u.a.y * u.res.y), float2(x, (u.a.y + u.a.w) * u.res.y), 0.8 * d, float4(a, a, a, a), vid, u.res);
     }
 
-    fragment float4 gwTone(V in [[stage_in]], constant U &u [[buffer(0)]], texture2d<float> light [[texture(0)]],
-                           texture2d<float> glow [[texture(1)]]) {
+    struct MapOut { float4 pos [[position]]; float2 uv; };
+
+    vertex MapOut gwMapVertex(uint vid [[vertex_id]], constant U &u [[buffer(0)]]) {
+        float2 corner = float2(vid & 1, vid >> 1);
+        float2 p = float2(u.a.x + u.a.z * corner.x, u.a.y + u.a.w * (0.53 + 0.47 * corner.y));
+        MapOut o;
+        o.pos = float4(p.x * 2 - 1, 1 - p.y * 2, 0, 1);
+        o.uv = corner;
+        return o;
+    }
+
+    // Energy over noise as light: faint speckle for the noise, the chirp burning amber to near white. Past the playhead
+    // the map is dimmed, still to come.
+    fragment float4 gwMapFragment(MapOut in [[stage_in]], constant U &u [[buffer(0)]], texture2d<float> map [[texture(0)]]) {
         constexpr sampler s(filter::linear, address::clamp_to_edge);
-        float3 c = light.sample(s, in.uv).rgb + glow.sample(s, in.uv).rgb * 0.6;
-        return float4(film(c), 1);
+        float e = map.sample(s, in.uv).r;
+        float v = clamp(log(1 + max(e - 0.5, 0.0)) / log(31.0), 0.0, 1.0);
+        float3 c = mix(float3(0.22, 0.3, 0.42), float3(1.0, 0.66, 0.32), smoothstep(0.25, 0.7, v));
+        c = mix(c, float3(1.0, 0.95, 0.85), smoothstep(0.7, 1.0, v));
+        float t = u.b.x + (u.b.y - u.b.x) * in.uv.x;
+        float past = t <= u.b.z ? 1.0 : 0.3;
+        float alpha = smoothstep(0.08, 0.6, v) * 0.85 * past * u.b.w;
+        return float4(c * alpha, alpha);
     }
     """
+}
+
+private func smoothstep(_ a: Double, _ b: Double, _ x: Double) -> Double {
+    let t = min(max((x - a) / (b - a), 0), 1)
+    return t * t * (3 - 2 * t)
 }

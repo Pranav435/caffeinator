@@ -2,7 +2,7 @@ import AppKit
 import Metal
 import simd
 
-/// The pulsar map from the Pioneer plaques and the Voyager Golden Record, rebuilt in 3D over a faint Milky Way:
+/// The pulsar map from the Pioneer plaques and the Voyager Golden Record, rebuilt in 3D over the real Milky Way:
 /// lines from the Sun to fourteen pulsars, each as long as the pulsar is far, each marked in binary with its period
 /// in units of the hydrogen line, and each pulsar flickering at its true rate. Two at a time come into focus, clicking.
 @MainActor final class Pulsars: Scene {
@@ -67,18 +67,17 @@ import simd
         return "\(SpaceKit.number(period, decimals: 2)) seconds"
     }
 
-    private let discPipe: MTLRenderPipelineState
+    private let beamPipe: MTLRenderPipelineState
+    private let sky: SkyBackdrop
+    private let lens: Lens
     private let linePipe: MTLRenderPipelineState
     private let glowPipe: MTLRenderPipelineState
-    private let tonePipe: MTLRenderPipelineState
     private let labelPipe: MTLRenderPipelineState
-    private let bloom: Bloom
     private let segments: MTLBuffer
     private let segmentCount: Int
     private let rings: [Ring]
     private var light: MTLTexture?
-    /// The galaxy behind, smooth enough for half resolution.
-    private var backdrop: MTLTexture?
+    private var yaw = Double.pi
     private var labels: Labels?
 
     private var pair: Int
@@ -91,6 +90,8 @@ import simd
     private var clock = 0.0
 
     var scale: Float { 1 }
+    var ready: Bool { sky.loaded }
+    var credit: String? { sky.texture == nil ? nil : MilkyWay.credit + "; pulsars: ATNF Pulsar Catalogue" }
     var facts: String? {
         let lines = Self.pairs[pair].map { i -> String in
             let p = Self.all[i]
@@ -104,13 +105,13 @@ import simd
 
     init(gpu: GPU) throws {
         let library = try gpu.library(SpaceKit.metal + Self.source)
-        discPipe = try gpu.pipeline(library, "galaxyDisc")
+        beamPipe = try gpu.pipeline(library, "beamFragment", vertex: "beamVertex", blend: .add)
+        sky = try SkyBackdrop(gpu: gpu)
+        lens = try Lens(gpu: gpu)
         linePipe = try gpu.pipeline(library, "lineFragment", vertex: "plaqueVertex", blend: .add)
         glowPipe = try gpu.pipeline(library, "glowFragment", vertex: "beaconVertex", blend: .add)
-        tonePipe = try gpu.pipeline(library, "pulsarTone")
         labelPipe = try gpu.pipeline(library, "labelFragment", vertex: "labelVertex", blend: .alpha)
-        bloom = try Bloom(gpu: gpu)
-        rings = (0..<4).map { _ in Ring(gpu: gpu, bytes: 2048) }
+        rings = (0..<5).map { _ in Ring(gpu: gpu, bytes: 2048) }
         pair = (Snapshot.variant ?? Int.random(in: 0..<Self.pairs.count)) % Self.pairs.count
         focus = [Float](repeating: 0, count: Self.all.count)
         counts = [Int](repeating: 0, count: Self.all.count)
@@ -136,13 +137,13 @@ import simd
     }
 
     private static func focusPoint(_ index: Int) -> SIMD3<Double> {
-        if index == 0 { return SIMD3(4.5, 0, 0) }
+        if index == 0 { return SIMD3(0.4, 0, 0) }
         let pair = pairs[index]
         return pair.map { position(all[$0]) }.reduce(.zero, +) / Double(pair.count) * 0.45
     }
 
     private static func focusDistance(_ index: Int) -> Double {
-        if index == 0 { return 27 }
+        if index == 0 { return 7 }
         let far = pairs[index].map { all[$0].distance }.max() ?? 2
         return min(max(2.8 * far + 0.7, 1.3), 12)
     }
@@ -167,9 +168,14 @@ import simd
         distance += (Self.focusDistance(pair) - distance) * ease
 
         let t = Double(f.time) + Double(f.seed) * 50
-        let yaw = t * 2 * .pi / 720
-        let elevation = Astro.rad(44 + 14 * sin(t * 0.006))
-        let eye = target + SIMD3(cos(elevation) * cos(yaw), cos(elevation) * sin(yaw), sin(elevation)) * distance
+        // The eye sits on the far side of the Sun from the pair in focus, so the real sky behind each pulsar is
+        // about where that pulsar lies in it; the view sways a little either side.
+        let c = Self.focusPoint(pair)
+        let goal = pair == 0 ? Double.pi : atan2(c.y, c.x) + .pi
+        yaw += remainder(goal - yaw, 2 * .pi) * ease
+        let swing = yaw + 0.5 * sin(t * 2 * .pi / 240)
+        let elevation = Astro.rad(15 + 6 * sin(t * 0.006))
+        let eye = target + SIMD3(cos(elevation) * cos(swing), cos(elevation) * sin(swing), sin(elevation)) * distance
         let forward = simd_normalize(target - eye)
         let right = simd_normalize(simd_cross(forward, SIMD3(0, 0, 1)))
         let up = simd_cross(right, forward)
@@ -179,7 +185,6 @@ import simd
 
         if light?.width != f.target.width || light?.height != f.target.height {
             light = f.gpu.texture(f.target.width, f.target.height)
-            backdrop = f.gpu.texture(f.target.width / 2, f.target.height / 2)
             labels = makeLabels(f)
         }
         let light = light!
@@ -204,23 +209,51 @@ import simd
         let beaconBuffer = rings[0].next(beacons)
         let focusBuffer = rings[1].next(focus)
 
-        f.cmd.draw(discPipe, into: backdrop!, uniforms: view)
-        f.cmd.draw(linePipe, into: light, uniforms: view, buffers: [segments, focusBuffer],
+        func eq(_ v: SIMD3<Double>) -> SIMD3<Float> { f3(SpaceSky.equatorial(galactic: v)) }
+        sky.draw(f.cmd, into: light, camera: SkyBackdrop.Camera(right: eq(right), up: eq(up), forward: eq(forward), focal: 2.0),
+                 exposure: 0.55, soften: 0.6, stars: 0.45)
+        f.cmd.draw(beamPipe, into: light, clear: false, uniforms: view, buffers: [rings[3].next(beams(now))],
+                   vertices: 4, instances: 2 * Self.all.count, primitive: .triangleStrip)
+        f.cmd.draw(linePipe, into: light, clear: false, uniforms: view, buffers: [segments, focusBuffer],
                    vertices: 4, instances: segmentCount, primitive: .triangleStrip)
         f.cmd.draw(glowPipe, into: light, clear: false, uniforms: view, buffers: [beaconBuffer],
                    vertices: 4, instances: beacons.count / 2, primitive: .triangleStrip)
-        let glow = bloom.glow(f.cmd, light)
-        f.cmd.draw(tonePipe, into: f.target, uniforms: f.uniforms(), textures: [light, glow, backdrop!])
+        lens.develop(f, light, Lens.Look(exposure: 1.0, white: [1, 0.99, 0.98], bloom: 0.05, halation: 0.02, vignette: 0.3, aberration: 1.0, grain: 0.4))
 
         if let labels { drawLabels(f, labels, eye: eye, right: right, up: up, forward: forward, density: density) }
         if let synth = f.sound { play(synth, f, focused, eye: eye, right: right) }
     }
 
+    /// Each pulsar's two radio beams, as lighthouse cones along its magnetic axis, which is tilted from the spin axis and
+    /// sweeps round it. The sweep is drawn no faster than a quarter turn a second so nothing strobes; the glow at the
+    /// pulsar still flickers at the true rate. Per beam: apex and length, direction and half-width, intensity and focus.
+    private func beams(_ now: Double) -> [SIMD4<Float>] {
+        var out: [SIMD4<Float>] = []
+        for (i, p) in Self.all.enumerated() {
+            let h = Double(i) * 12.9898
+            let spin = simd_normalize(SIMD3(sin(h * 3.1), cos(h * 1.7), 0.6 + 0.4 * sin(h)))
+            let e1 = simd_normalize(simd_cross(spin, abs(spin.x) < 0.9 ? SIMD3(1, 0, 0) : SIMD3(0, 1, 0)))
+            let e2 = simd_cross(spin, e1)
+            let tilt = Astro.rad(35 + 40 * (0.5 + 0.5 * sin(h * 5.3)))
+            let rate = min(1 / p.period, 0.25)
+            let phi = 2 * Double.pi * (now * rate + Double(i) * 0.37)
+            let m = spin * cos(tilt) + (e1 * cos(phi) + e2 * sin(phi)) * sin(tilt)
+            let apex = Self.position(p)
+            for side in [1.0, -1.0] {
+                let d = m * side
+                out.append(SIMD4(Float(apex.x), Float(apex.y), Float(apex.z), 0.55))
+                out.append(SIMD4(Float(d.x), Float(d.y), Float(d.z), Float(tan(Astro.rad(9)))))
+                out.append(SIMD4(0.55, focus[i], 0, 0))
+            }
+        }
+        return out
+    }
+
     private func makeLabels(_ f: Frame) -> Labels {
         var items: [(String, Labels.Style)] = []
         for p in Self.all {
-            items.append((Self.title(p), Labels.Style(size: 10.5, weight: .medium, tracking: 0.5)))
-            items.append((Self.short(p.period), Labels.Style(size: 9.5, weight: .regular, tracking: 0.3)))
+            items.append((Self.title(p), Labels.Style(size: 10, weight: .regular, tracking: 0.8)))
+            items.append((Self.short(p.period), Labels.Style(size: 9, weight: .light, tracking: 0.5)))
         }
         items.append(("SUN", Labels.Style(size: 10, weight: .semibold, tracking: 2)))
         items.append(("TO THE GALACTIC CENTRE", Labels.Style(size: 9.5, weight: .regular, tracking: 1.5)))
@@ -274,7 +307,7 @@ import simd
                 quads.append(q)
             }
         }
-        if let at = pixel(SIMD3(pair == 0 ? 6 : 2.6, 0, 0)), let q = labels.quad("TO THE GALACTIC CENTRE", at: at + SIMD2(0, -8 * density), anchor: [0.5, 1],
+        if let at = pixel(SIMD3(pair == 0 ? 4.6 : 2.6, 0, 0)), let q = labels.quad("TO THE GALACTIC CENTRE", at: at + SIMD2(0, -8 * density), anchor: [0.5, 1],
                                                                 color: .premultiplied(0.9, 0.85, 0.75, 0.35)) {
             quads.append(q)
         }
@@ -317,45 +350,6 @@ import simd
         float z = max(dot(d, u.d.xyz), 0.01);
         float2 p = float2(dot(d, u.b.xyz), dot(d, u.c.xyz)) * u.a.w / z;
         return float3((p.x / (u.res.x / u.res.y) * 0.5 + 0.5) * u.res.x, (0.5 - p.y * 0.5) * u.res.y, z);
-    }
-
-    // The Milky Way's disc seen from outside: four logarithmic spiral arms with knots of young blue stars and pink
-    // nebulae, dust lanes along their inner edges, and the old yellow bar and bulge, the Sun between the Sagittarius
-    // and Perseus arms 8.2 kiloparsecs out.
-    fragment float4 galaxyDisc(V in [[stage_in]], constant U &u [[buffer(0)]]) {
-        float2 p = (in.uv * 2 - 1) * float2(u.res.x / u.res.y, -1) / u.a.w;
-        float3 rd = normalize(u.d.xyz + p.x * u.b.xyz + p.y * u.c.xyz);
-        float3 c = float3(0.0012, 0.0014, 0.0026);
-        if (abs(rd.z) > 1e-4) {
-            float t = -u.a.z / rd.z;
-            if (t > 0) {
-                float2 q = (u.a.xyz + rd * t).xy - float2(8.2, 0);   // galactocentric
-                float R = length(q);
-                float theta = atan2(q.y, q.x);
-                // Two major arms and two minor ones, wavering and broken up by clumps of star formation.
-                float pitch = 0.24;
-                float2 w = q * 0.9;
-                float clump = fbm(w * 1.3, 5);
-                float phase = theta - log(max(R, 0.3)) / pitch + 0.5 * (fbm(q * 0.35 + 3.0, 3) - 0.5);
-                float k = PI - log(10.0) / pitch;
-                float turn = (phase - k) / (PI / 2) + 0.5;
-                float s = fract(turn) - 0.5;
-                float major = fmod(abs(floor(turn)), 2.0) < 0.5 ? 1.0 : 0.4;
-                float width = 0.35 + 0.05 * R;
-                float arm = major * exp(-pow(s * (PI / 2) * R * sin(pitch) / width, 2.0)) * (0.55 + 0.9 * fbm(q * 0.7 + 9.0, 3));
-                float dust = major * exp(-pow((s + 0.08) * (PI / 2) * R * sin(pitch) / (width * 0.4), 2.0));
-                float disc = exp(-R / 4.5) * smoothstep(17.0, 10.0, R);
-                float bulge = exp(-length(float2(dot(q, float2(0.87, 0.5)), dot(q, float2(-0.5, 0.87)) * 2.4)) / 1.1);
-                float3 young = float3(0.55, 0.68, 1.0) * arm * (0.4 + 1.2 * clump * clump) * disc * 2.2;
-                float3 old = float3(1.0, 0.78, 0.5) * (disc * 0.45 + bulge * 2.4);
-                float nebula = smoothstep(0.66, 0.8, fbm(w * 3.1 + 5.0, 4)) * arm;
-                float3 col = (young + old * (0.5 + 0.5 * clump)) * (1 - 0.6 * dust * smoothstep(1.5, 4.0, R));
-                col += float3(1.0, 0.35, 0.5) * nebula * disc * 1.4;
-                float fade = exp(-t / 90.0) * smoothstep(0.0, 0.08, abs(rd.z));
-                c += col * 0.09 * fade;
-            }
-        }
-        return float4(c, 1);
     }
 
     // b: buffer 1 holds segments (start, end, info), buffer 2 the focus of each pulsar.
@@ -408,11 +402,35 @@ import simd
         return o;
     }
 
-    fragment float4 pulsarTone(V in [[stage_in]], constant U &u [[buffer(0)]], texture2d<float> light [[texture(0)]],
-                               texture2d<float> glow [[texture(1)]], texture2d<float> back [[texture(2)]]) {
-        constexpr sampler s(filter::linear, address::clamp_to_edge);
-        float3 c = back.sample(s, in.uv).rgb + light.sample(s, in.uv).rgb + glow.sample(s, in.uv).rgb * 0.6;
-        return float4(film(c), 1);
+    struct BeamOut { float4 pos [[position]]; float4 color; float across; float along; };
+
+    // A radio beam: a soft cone from the pulsar, widening and fading with distance. Buffer: apex and length, direction
+    // and tan of the half angle, intensity and focus, in threes.
+    vertex BeamOut beamVertex(uint vid [[vertex_id]], uint iid [[instance_id]], constant U &u [[buffer(0)]],
+                              const device float4 *b [[buffer(1)]]) {
+        float4 apex = b[3 * iid], dir = b[3 * iid + 1], info = b[3 * iid + 2];
+        float3 pa = viewOf(apex.xyz, u), pb = viewOf(apex.xyz + dir.xyz * apex.w, u);
+        float2 d = pb.xy - pa.xy;
+        float len = length(d);
+        float2 t = len > 1e-3 ? d / len : float2(1, 0);
+        float2 n = float2(-t.y, t.x);
+        float hw = apex.w * dir.w * u.a.w / max(pb.z, 0.01) * u.res.y * 0.5;
+        float far = (vid & 1) ? 1.0 : 0.0;
+        float side = (vid & 2) ? 1.0 : -1.0;
+        float2 p = mix(pa.xy, pb.xy, far) + n * side * (far > 0.5 ? hw : 0.5 * u.d.w);
+        BeamOut o;
+        o.pos = pixelToClip(p, u.res);
+        o.color = float4(0.6, 0.78, 1.0, 0) * info.x * (0.2 + 0.8 * info.y) * 0.3;
+        o.across = side * far;
+        o.along = far;
+        return o;
+    }
+
+    fragment float4 beamFragment(BeamOut in [[stage_in]]) {
+        float a = in.across;
+        // Brightest on the axis; the quad's two ends interpolate, so the cone fades out along its length.
+        float edge = exp(-a * a * 3.0);
+        return in.color * edge * (1 - in.along * 0.85) * (0.15 + 0.85 * (1 - in.along));
     }
     """
 }

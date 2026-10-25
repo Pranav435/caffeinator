@@ -49,15 +49,14 @@ import Metal
     private let im: MTLBuffer
     private let column: MTLBuffer
     private let hits: MTLBuffer
-    private let capacity = 8192
+    private let capacity = 16384
     private let stepRe: MTLComputePipelineState
     private let stepIm: MTLComputePipelineState
     private let launch: MTLComputePipelineState
     private let probe: MTLComputePipelineState
     private let field: MTLRenderPipelineState
     private let dots: MTLRenderPipelineState
-    private let tone: MTLRenderPipelineState
-    private let bloom: Bloom
+    private let lens: Lens
     private var light: MTLTexture?
 
     private var setupIndex: Int
@@ -93,8 +92,7 @@ import Metal
         probe = try gpu.kernel(library, "slitProbe")
         field = try gpu.pipeline(library, "slitField")
         dots = try gpu.pipeline(library, "sprite", vertex: "slitHit", blend: .add)
-        tone = try gpu.pipeline(library, "slitTone")
-        bloom = try Bloom(gpu: gpu)
+        lens = try Lens(gpu: gpu)
         re = gpu.buffer([Float](repeating: 0, count: Self.nx * Self.ny))
         im = gpu.buffer([Float](repeating: 0, count: Self.nx * Self.ny))
         column = gpu.buffer([Float](repeating: 0, count: Self.ny))
@@ -102,12 +100,8 @@ import Metal
         setupIndex = (Snapshot.variant ?? Int.random(in: 0..<Self.setups.count)) % Self.setups.count
     }
 
-    /// The first grid column on screen: the detector plate takes about a fifth of the width, the tank the rest.
-    private func left(_ f: Frame) -> Float {
-        let cell = f.size.y / Float(Self.ny)
-        let plate = max(0.18 * f.size.x, 0.2 * f.size.y)
-        return max(Self.screen - (f.size.x - plate) / cell, 150)
-    }
+    /// The first grid column of the inset; the whole tank shows, from the packet's birth to the screen.
+    private func left(_ f: Frame) -> Float { 150 }
 
     /// Simulation constants for the kernels: a = (dt, k, energy, damping), b = barrier (x, half thickness, height, slits),
     /// c = slits (spacing, half width, centre y), d = packet (x, y, sigma x, sigma y).
@@ -135,7 +129,7 @@ import Metal
             f.cmd.compute(launch, Self.nx, Self.ny, uniforms: simUniforms(f), buffers: [re, im])
             packets += 1
             // The next electron leaves as this one's centre reaches the screen.
-            nextPacket = simTime + (Self.screen - left(f) + 72) / sin(setup.k) * 0.9 + 100
+            nextPacket = simTime + (Self.screen - left(f) + 72) / sin(setup.k) * 0.6 + 60
         }
 
         carry += f.dt * Self.pace / Self.step
@@ -159,8 +153,8 @@ import Metal
         u.d = SIMD4(left(f), 0, 0, 0)
         f.cmd.draw(field, into: light!, uniforms: u, buffers: [re, im, column])
         f.cmd.draw(dots, into: light!, clear: false, uniforms: u, buffers: [hits], vertices: capacity, primitive: .point)
-        let glow = bloom.glow(f.cmd, light!)
-        f.cmd.draw(tone, into: f.target, uniforms: u, textures: [light!, glow])
+        lens.develop(f, light!, Lens.Look(exposure: 1.3, white: [0.98, 1.0, 1.0], bloom: 0.09, halation: 0.02, vignette: 0.4,
+                                          aberration: 1.5, grain: 0.7))
 
         if let synth = f.sound {
             let root = 98 * setup.k / 0.6
@@ -178,9 +172,9 @@ import Metal
         for y in 0..<Self.ny { total += max(p[y], 0) }
         guard total.isFinite, total > 0 else { return }
         // Each packet carries 2π σx σy of probability, about two thirds of what lines up with the slits reaches the
-        // screen, and each packet should make about 150 hits whatever the slits.
+        // screen, and each packet should make about 2000 hits whatever the slits.
         let norm = 2 * Float.pi * Self.sigma.x * Self.sigma.y
-        let mean = total * sin(setup.k) * frameSim / norm * 150 / (0.65 * setup.opening(Self.sigma.y))
+        let mean = total * sin(setup.k) * frameSim / norm * 2000 / (0.65 * setup.opening(Self.sigma.y))
         let n = min(poisson(mean), 40)
         guard n > 0 else { return }
         let h = hits.contents().assumingMemoryBound(to: SIMD4<Float>.self)
@@ -301,38 +295,41 @@ import Metal
         return mix(mix(a, b, t.x), mix(c, d, t.x), t.y);
     }
 
-    // The wave tank, the barrier and the dark detector plate. pad.x is simulation time, d.x the first grid column shown.
+    // Hero: the phosphor screen (right 70% of the frame), read like Tonomura's monitor. A small inset at the left shows
+    // what the wave does. pad.x is simulation time, d.x the first grid column of the inset.
     fragment float4 slitField(V in [[stage_in]], constant U &u [[buffer(0)]], const device float *re [[buffer(1)]],
                               const device float *im [[buffer(2)]], const device float *col [[buffer(3)]]) {
         int w = slitW, h = slitH;
-        float cell = float(h) / u.res.y;
-        float2 q = float2(in.uv.x * u.res.x * cell + u.d.x, in.uv.y * float(h));
-        float3 c = float3(0.004, 0.005, 0.009) * (1.2 - 0.6 * abs(in.uv.y - 0.5));
-        if (q.x < u.c.w) {
+        float2 px = in.pos.xy;
+        float3 phosphor = float3(0.45, 1.0, 0.6);
+        float3 c = float3(0.0015, 0.0017, 0.002);
+        float2 s0 = float2(0.30, 0.05) * u.res, s1 = float2(0.975, 0.95) * u.res;
+        float cols = u.c.w + 25.0 - u.d.x;
+        float iw = 0.255 * u.res.x, ih = iw * float(h) / cols;
+        float2 i0 = float2(0.02 * u.res.x, 0.5 * u.res.y - 0.5 * ih);
+        if (all(px > s0) && all(px < s1)) {
+            float2 t = (px - s0) / (s1 - s0);
+            float grain = hash12(floor(px / max(u.res.y / 800, 1.0)));
+            float edge = smoothstep(0.0, 0.01, min(min(t.x, 1 - t.x), min(t.y, 1 - t.y)));
+            c = phosphor * (0.012 + 0.012 * grain) * (0.8 + 0.2 * sin(t.y * 3.0)) * edge;
+            // A faint, slowly drifting beam spot as the electrons arrive: the screen is never uniformly dark.
+            c += phosphor * 0.006 * exp(-pow((t.x - 0.5) * 3.0, 2.0));
+        } else if (all(px > i0) && all(px < i0 + float2(iw, ih))) {
+            float cell = cols / iw;
+            float2 q = float2(u.d.x + (px.x - i0.x) * cell, (px.y - i0.y) * cell);
             float2 psi = psiAt(re, im, q, w, h);
             float rho = dot(psi, psi);
-            // Hue is the phase relative to the incoming plane wave, so each diffracted direction and each fringe takes its
-            // own colour; brightness ripples with the full phase, so the wavefronts still show as crests.
             float full = atan2(psi.y, psi.x) + u.a.z * u.pad.x;
-            float a = full - u.a.y * q.x + u.time * 0.12;
-            float b = 1 - exp(-pow(rho, 0.6) * 2.5);
-            float crest = 0.6 + 0.4 * cos(full - u.a.z * u.pad.x * 0.2);
-            c += phaseHue(a) * b * crest * 1.2 + float3(0.9, 0.95, 1.0) * max(rho - 1.5, 0.0) * 0.05;
+            float b = 1 - exp(-pow(rho, 0.7) * 1.6);
+            float crest = 0.55 + 0.45 * cos(full - u.a.y * q.x);
+            c = float3(0.2, 0.38, 0.42) * b * crest * 1.8 + float3(0.004);
             float sd = slitSDF(q, u);
-            float edge = smoothstep(cell * 1.5, -cell * 0.5, sd);
-            float rim = exp(-abs(sd) / (cell * 1.2));
-            float3 wall = float3(0.03, 0.033, 0.042) * (0.8 + 0.4 * hash12(floor(q * 2))) + float3(0.16, 0.17, 0.2) * rim * 0.5
-                        + phaseHue(a) * b * rim * 0.6;
-            c = mix(c, wall, edge);
-            // The plate glows where the wave lands.
+            c = mix(c, float3(0.12), smoothstep(cell * 1.2, -cell * 0.4, sd));
             float land = col[clamp(int(q.y), 0, h - 1)];
-            c += float3(0.6, 0.8, 1.0) * pow(land, 0.5) * 2.5 * exp(-(u.c.w - q.x) / 2.5);
-        } else {
-            float px = (q.x - u.c.w) / cell;
-            float n = hash12(floor(in.pos.xy * 0.5)) * 0.004;
-            c = float3(0.010, 0.012, 0.016) + n;
-            float land = col[clamp(int(q.y), 0, h - 1)];
-            c += float3(0.6, 0.8, 1.0) * (0.02 + pow(land, 0.5) * 2.0) * exp(-px / 3);
+            c += phosphor * pow(land, 0.5) * 0.4 * exp(-(u.c.w - q.x) / 3) * step(q.x, u.c.w);
+            c *= step(q.x, u.c.w + 12);
+            float2 e = min(px - i0, i0 + float2(iw, ih) - px);
+            c += float3(0.08) * step(min(e.x, e.y), 1.5);
         }
         return float4(c, 1);
     }
@@ -340,25 +337,17 @@ import Metal
     // Each detection is a dot on the plate that flashes as it lands and then stays. pad.y is time since the plate was wiped.
     vertex P slitHit(uint id [[vertex_id]], constant U &u [[buffer(0)]], const device float4 *hits [[buffer(1)]]) {
         float4 hit = hits[id];
-        float cell = float(slitH) / u.res.y;
-        float x0 = (u.c.w - u.d.x) / cell + 10, x1 = u.res.x - 10;
-        float2 px = float2(mix(x0, x1, hit.x), hit.y * u.res.y);
+        // hit.y is the position across the fringes, drawn along the screen's width so the stripes stand upright.
+        float2 px = float2(mix(0.305, 0.97, hit.y), mix(0.06, 0.94, hit.x)) * u.res;
         float age = u.time - hit.z;
-        float fresh = exp(-age * 2.5);
+        float fresh = exp(-age * 2.2);
         float wipe = age > u.pad.y ? clamp(1 - u.pad.y / 2.5, 0.0, 1.0) : 1.0;
         P o;
         o.pos = float4(px / u.res * float2(2, -2) + float2(-1, 1), 0, 1);
-        o.size = (4 + 9 * fresh) * u.res.y / 1000;
-        float3 tint = mix(float3(1.0, 0.88, 0.7) * 1.1, float3(0.55, 0.85, 1.0) * 5, fresh) * hit.w;
+        o.size = (3.0 + 9 * fresh) * u.res.y / 1000;
+        float3 tint = mix(float3(0.4, 1.0, 0.55) * 2.8, float3(0.75, 1.0, 0.85) * 8, fresh) * hit.w;
         o.color = float4(tint * wipe * (age >= 0 ? 1.0 : 0.0), 0);
         return o;
-    }
-
-    fragment float4 slitTone(V in [[stage_in]], constant U &u [[buffer(0)]], texture2d<float> light [[texture(0)]],
-                             texture2d<float> glow [[texture(1)]]) {
-        constexpr sampler s(filter::linear, address::clamp_to_edge);
-        float3 c = light.sample(s, in.uv).rgb + glow.sample(s, in.uv).rgb * 0.35;
-        return float4(film(c), 1);
     }
     """
 }

@@ -42,16 +42,30 @@ import simd
     /// Distance from the Sun on screen: logarithmic, so Mercury and Neptune both fit.
     static func compress(_ r: Double) -> Double { log(1 + r / 0.35) / log(1 + 31 / 0.35) }
 
-    private struct Body { var pos: SIMD4<Float>; var light: SIMD4<Float>; var info: SIMD4<Float> }
+    private struct Body { var pos: SIMD4<Float>; var light: SIMD4<Float>; var info: SIMD4<Float>; var axis: SIMD4<Float>; var meridian: SIMD4<Float> }
+
+    /// North pole of each body as (right ascension, declination) in degrees (IAU), and a rotation offset in turns.
+    private static let poles: [(ra: Double, dec: Double)] = [(281.01, 61.41), (272.76, 67.16), (0, 90), (317.68, 52.89),
+                                                              (268.06, 64.50), (40.59, 83.54), (257.31, -15.18), (299.36, 43.46)]
+    private static let textureNames = ["mercury", "venus_atmosphere", "earth_daymap", "mars", "jupiter", "saturn", "uranus", "neptune", "moon"]
+    private static func textureURL(_ name: String, _ ext: String = "jpg") -> URL {
+        URL(string: "https://www.solarsystemscope.com/textures/download/2k_\(name).\(ext)")!
+    }
+    private static let sunURL = URL(string: "https://sdo.gsfc.nasa.gov/assets/img/latest/latest_1024_HMIIC.jpg")!
 
     private let orbitPipe: MTLRenderPipelineState
     private let dustPipe: MTLRenderPipelineState
     private let bodyPipe: MTLRenderPipelineState
     private let sunPipe: MTLRenderPipelineState
-    private let backPipe: MTLRenderPipelineState
-    private let tonePipe: MTLRenderPipelineState
+    private let sky: SkyBackdrop
+    private let lens: Lens
+    private let blank: MTLTexture
+    private var maps: [MTLTexture?] = Array(repeating: nil, count: 9)
+    private var clouds: MTLTexture?
+    private var ringMap: MTLTexture?
+    private var sunMap: MTLTexture?
+    private var loading = true
     private let labelPipe: MTLRenderPipelineState
-    private let bloom: Bloom
     private let dust: MTLBuffer
     private let dustCount: Int
     private let rings: [Ring]
@@ -74,7 +88,12 @@ import simd
     private var summaryAt: Float = 0
 
     var scale: Float { 1 }
+    var ready: Bool { !loading && sky.loaded }
     var facts: String? { summary }
+    var credit: String? {
+        (maps.contains { $0 != nil } ? "Planet maps: Solar System Scope (CC BY 4.0, NASA and USGS data)" : "")
+            + (sunMap != nil ? "; Sun: NASA/SDO (HMI)" : "") + (sky.texture != nil ? "; Milky Way: ESO/S. Brunier" : "")
+    }
 
     init(gpu: GPU) throws {
         let library = try gpu.library(SpaceKit.metal + Self.source)
@@ -82,10 +101,11 @@ import simd
         dustPipe = try gpu.pipeline(library, "glowFragment", vertex: "dustVertex", blend: .add)
         bodyPipe = try gpu.pipeline(library, "planetFragment", vertex: "planetVertex", blend: .alpha)
         sunPipe = try gpu.pipeline(library, "sunFragment", vertex: "sunVertex", blend: .add)
-        backPipe = try gpu.pipeline(library, "orreryBack")
-        tonePipe = try gpu.pipeline(library, "orreryTone")
+        sky = try SkyBackdrop(gpu: gpu)
+        lens = try Lens(gpu: gpu)
+        var white: [UInt8] = [255, 255, 255, 255]
+        blank = white.withUnsafeMutableBytes { gpu.texture(1, 1, .rgba8Unorm, bytes: $0.baseAddress!, bytesPerRow: 4) }
         labelPipe = try gpu.pipeline(library, "labelFragment", vertex: "labelVertex", blend: .alpha)
-        bloom = try Bloom(gpu: gpu)
         rings = (0..<6).map { _ in Ring(gpu: gpu, bytes: 1024) }
 
         // Minor bodies, each a = semi-major axis, e, mean anomaly at the start, and kind:
@@ -110,14 +130,20 @@ import simd
             items += [SIMD4(.random(in: 39...48), .random(in: 0...0.2), .random(in: 0..<360), 2),
                       SIMD4(.random(in: 0..<360), .random(in: -10...10), .random(in: 0.2...1), 0)]
         }
-        for _ in 0..<1800 {
-            let z = Float.random(in: -1...1), phi = Float.random(in: 0..<2 * .pi)
-            items += [SIMD4(sqrt(1 - z * z) * cos(phi), sqrt(1 - z * z) * sin(phi), z, 3),
-                      SIMD4(0, 0, pow(.random(in: 0...1), 3), .random(in: 0..<1))]
-        }
         dustCount = items.count / 2
         dust = gpu.buffer(items)
         orbitTints = gpu.buffer(Self.planets.map { SIMD4($0.color, 0) })
+        Task { @MainActor [weak self] in
+            // One map at a time, each fetched once and kept in the cache for months.
+            for (i, name) in Self.textureNames.enumerated() {
+                let t = await Imagery.texture(Self.textureURL(name), gpu, maxSize: 2048, maxAge: 365 * 86400)
+                self?.maps[i] = t
+            }
+            self?.clouds = await Imagery.texture(Self.textureURL("earth_clouds"), gpu, maxSize: 2048, maxAge: 365 * 86400)
+            self?.ringMap = await Imagery.texture(Self.textureURL("saturn_ring_alpha", "png"), gpu, maxSize: 2048, maxAge: 365 * 86400)
+            self?.sunMap = await Imagery.texture(Self.sunURL, gpu, maxSize: 1024, maxAge: 6 * 3600)
+            self?.loading = false
+        }
     }
 
     // MARK: Camera
@@ -192,46 +218,48 @@ import simd
         var bodies: [Body] = []
         var helio: [SIMD3<Double>] = []
         var mean: [Float] = []
+        let turn = Double(f.time)
         for (i, p) in Self.planets.enumerated() {
             let el = p.elements(d)
             let h = Astro.position(el)
             helio.append(h)
             mean.append(Float(Astro.norm(el.M) / 360))
             let q = Self.scenePoint(h)
-            let sun = simd_normalize(-q)
-            let lightDir = SIMD3((sun * cam.right).sum(), (sun * cam.up).sum(), -(sun * cam.forward).sum())
-            let size = Float(3.0 + 2.3 * log(1 + p.radius))
-            bodies.append(Body(pos: SIMD4(f3(q), size * density), light: SIMD4(f3(lightDir), Float(i)), info: SIMD4(p.color, fade)))
+            let size = Float(8 + 4.6 * log(1 + p.radius))
+            let pole = Self.ecliptic(ra: Self.poles[i].ra, dec: Self.poles[i].dec)
+            // Slow, calm spin: a real day passes in a blink at this pace, so the globes just turn gently.
+            let meridian = Self.meridian(pole, angle: turn * 0.05 * (i % 2 == 0 ? 1 : 0.7) + Double(i) * 1.3)
+            bodies.append(Self.body(q, size * density, h, i, pole, meridian, p.color, fade, cam))
         }
         // Earth's Moon, at its real angle round Earth, on a stretched-out orbit so it clears the planet.
         let moonLon = Astro.rad(Astro.ecliptic(Astro.moon(date), date))
         let earth = Self.scenePoint(helio[2])
-        let moonPos = earth + SIMD3(cos(moonLon), sin(moonLon), 0) * 0.028
-        let mLight = simd_normalize(-moonPos)
-        bodies.append(Body(pos: SIMD4(f3(moonPos), 1.6 * density),
-                           light: SIMD4(Float((mLight * cam.right).sum()), Float((mLight * cam.up).sum()), Float(-(mLight * cam.forward).sum()), 8),
-                           info: SIMD4(0.75, 0.73, 0.7, fade)))
+        let toMoon = SIMD3(cos(moonLon), sin(moonLon), 0)
+        let moonPos = earth + toMoon * 0.028
+        bodies.append(Self.body(moonPos, 2.4 * density, helio[2], 8, SIMD3(0, 0, 1), -toMoon, SIMD3(0.75, 0.73, 0.7), fade, cam))
 
         let light = light!
-        f.cmd.draw(backPipe, into: light, uniforms: view)
+        sky.draw(f.cmd, into: light, camera: Self.skyCamera(cam), exposure: 0.5 * fade, soften: 0.5, stars: 0.5 * fade)
         f.cmd.draw(dustPipe, into: light, clear: false, uniforms: view, buffers: [dust, rings[0].next(SIMD4(Float(days), fade, 0, 0))],
                    vertices: 4, instances: dustCount, primitive: .triangleStrip)
         let trails = Self.planets.map { Float($0.period / 150) }
         f.cmd.draw(orbitPipe, into: light, clear: false, uniforms: view, buffers: [orbits!, rings[1].next(mean + [fade] + trails), orbitTints],
                    vertices: 4, instances: Self.planets.count * orbitPoints, primitive: .triangleStrip)
-        f.cmd.draw(sunPipe, into: light, clear: false, uniforms: view, buffers: [rings[2].next(SIMD4(fade, 0, 0, 0))],
-                   vertices: 4, primitive: .triangleStrip)
+        f.cmd.draw(sunPipe, into: light, clear: false, uniforms: view, textures: [sunMap ?? blank],
+                   buffers: [rings[2].next(SIMD4(fade, sunMap == nil ? 0 : 1, 0, 0))], vertices: 4, primitive: .triangleStrip)
         // Far planets first, so near ones overlap them.
-        let order = bodies.indices.sorted { cam.pixel(SIMD3(Double(bodies[$0].pos.x), Double(bodies[$0].pos.y), Double(bodies[$0].pos.z))).1 >
-            cam.pixel(SIMD3(Double(bodies[$1].pos.x), Double(bodies[$1].pos.y), Double(bodies[$1].pos.z))).1 }
-        // Saturn's north pole (ecliptic longitude 79.5, latitude 61.9 degrees) in the camera's frame, for its rings.
-        let pole = SIMD3(cos(Astro.rad(61.9)) * cos(Astro.rad(79.5)), cos(Astro.rad(61.9)) * sin(Astro.rad(79.5)), sin(Astro.rad(61.9)))
-        let ringNormal = SIMD4(Float((pole * cam.right).sum()), Float((pole * cam.up).sum()), Float(-(pole * cam.forward).sum()), 0)
-        f.cmd.draw(bodyPipe, into: light, clear: false, uniforms: view, buffers: [rings[3].next(order.map { bodies[$0] }), rings[5].next(ringNormal)],
-                   vertices: 4, instances: bodies.count, primitive: .triangleStrip)
+        let order = bodies.indices.sorted { cam.pixel(Self.point(bodies[$0])).1 > cam.pixel(Self.point(bodies[$1])).1 }
+        let all = rings[3].next(bodies)
+        for i in order {
+            var u = view
+            let map = maps[i], second = i == 5 ? ringMap : i == 2 ? clouds : nil
+            u.pad = SIMD2(Float(i), Float((map == nil ? 0 : 1) + (second == nil ? 0 : 2)))
+            f.cmd.draw(bodyPipe, into: light, clear: false, uniforms: u, textures: [map ?? blank, second ?? blank], buffers: [all],
+                       vertices: 4, primitive: .triangleStrip)
+        }
 
-        let glow = bloom.glow(f.cmd, light)
-        f.cmd.draw(tonePipe, into: f.target, uniforms: f.uniforms(SIMD4(fade, 0, 0, 0)), textures: [light, glow])
+        lens.develop(f, light, Lens.Look(exposure: 1.1 * fade, white: [1, 0.99, 0.97], bloom: 0.05, halation: 0.025, vignette: 0.3,
+                                         aberration: 1.0, grain: 0.35))
 
         if let labels {
             var quads: [LabelQuad] = []
@@ -260,6 +288,38 @@ import simd
             summaryAt = f.time
             summarise(f, date, helio)
         }
+    }
+
+    /// A body ready for the GPU: scene position and size, light direction and pole in the camera's frame.
+    private static func body(_ q: SIMD3<Double>, _ size: Float, _ helio: SIMD3<Double>, _ index: Int, _ pole: SIMD3<Double>,
+                             _ meridian: SIMD3<Double>, _ color: SIMD3<Float>, _ fade: Float, _ cam: Camera) -> Body {
+        func inCamera(_ v: SIMD3<Double>) -> SIMD3<Float> {
+            SIMD3(Float((v * cam.right).sum()), Float((v * cam.up).sum()), Float(-(v * cam.forward).sum()))
+        }
+        let sun = simd_normalize(-q)
+        return Body(pos: SIMD4(Float(q.x), Float(q.y), Float(q.z), size), light: SIMD4(inCamera(sun), Float(index)),
+                    info: SIMD4(color, fade), axis: SIMD4(inCamera(pole), Float(simd_length(helio))),
+                    meridian: SIMD4(inCamera(meridian), 0))
+    }
+
+    private static func point(_ b: Body) -> SIMD3<Double> { SIMD3(Double(b.pos.x), Double(b.pos.y), Double(b.pos.z)) }
+
+    /// A pole given in equatorial coordinates, as an ecliptic unit vector.
+    private static func ecliptic(ra: Double, dec: Double) -> SIMD3<Double> {
+        let a = Astro.rad(ra), d = Astro.rad(dec), e = Astro.rad(23.4392911)
+        let v = SIMD3(cos(d) * cos(a), cos(d) * sin(a), sin(d))
+        return SIMD3(v.x, v.y * cos(e) + v.z * sin(e), -v.y * sin(e) + v.z * cos(e))
+    }
+
+    /// The direction of longitude zero: any vector across the pole, turned about it by `angle`.
+    private static func meridian(_ pole: SIMD3<Double>, angle: Double) -> SIMD3<Double> {
+        let across = simd_normalize(abs(pole.z) < 0.95 ? simd_cross(pole, SIMD3(0, 0, 1)) : SIMD3(1, 0, 0))
+        return across * cos(angle) + simd_cross(pole, across) * sin(angle)
+    }
+
+    private static func skyCamera(_ c: Camera) -> SkyBackdrop.Camera {
+        func eq(_ v: SIMD3<Double>) -> SIMD3<Float> { let e = SpaceSky.equatorial(ecliptic: v); return SIMD3(Float(e.x), Float(e.y), Float(e.z)) }
+        return SkyBackdrop.Camera(right: eq(c.right), up: eq(c.up), forward: eq(c.forward), focal: Float(c.zoom))
     }
 
     /// Each orbit as a ring of points with its mean anomaly, so the shader can light a fading trail behind the planet.
@@ -356,16 +416,6 @@ import simd
         return float3((p.x / (u.res.x / u.res.y) * 0.5 + 0.5) * u.res.x, (0.5 - p.y * 0.5) * u.res.y, z);
     }
 
-    // Deep space, faintly warmer toward the Sun.
-    fragment float4 orreryBack(V in [[stage_in]], constant U &u [[buffer(0)]]) {
-        float3 sun = viewOf(float3(0), u);
-        float r = length(in.uv * u.res - sun.xy) / u.res.y;
-        float3 c = float3(0.0016, 0.0019, 0.0034) + float3(0.012, 0.007, 0.003) * exp(-r * 3.5) + float3(0.002, 0.0015, 0.001) * exp(-r * 1.2);
-        float n = fbm(in.uv * float2(u.res.x / u.res.y, 1) * 2.5 + 7.0, 4);
-        c += float3(0.0015, 0.0012, 0.0028) * smoothstep(0.45, 0.8, n);
-        return float4(c, 1);
-    }
-
     // Orbits: points[i].w is planet index + mean anomaly. Buffer 2 holds each planet's current mean anomaly, the fade,
     // then how sharply each trail falls off (its period over 150 days, so every trail shows the last few months).
     vertex LineOut orbitVertex(uint vid [[vertex_id]], uint iid [[instance_id]], constant U &u [[buffer(0)]],
@@ -378,7 +428,7 @@ import simd
         float behind = fract(now[planet] - fract(a.w));
         float trail = exp(-behind * now[9 + planet]) * 0.7;
         float3 tint = mix(float3(0.5, 0.58, 0.8), tints[planet].rgb, 0.45 + 0.4 * trail);
-        float4 color = float4(tint * (0.06 + trail), 0) * now[8];
+        float4 color = float4(tint * (0.03 + 0.5 * trail), 0) * now[8];
         return lineQuad(pa.xy, pb.xy, 0.9 * u.d.w, color, vid, u.res);
     }
 
@@ -424,98 +474,138 @@ import simd
     vertex GlowOut sunVertex(uint vid [[vertex_id]], constant U &u [[buffer(0)]], constant float4 &t [[buffer(1)]]) {
         float2 corner = float2(vid & 1, vid >> 1) * 2 - 1;
         float3 p = viewOf(float3(0), u);
-        float radius = 15 * u.d.w * 2.2 / p.z;
+        float radius = 28 * u.d.w * 0.9 * sqrt(2.2 / p.z);
         GlowOut o;
         o.pos = pixelToClip(p.xy + corner * radius * 6, u.res);
         o.uv = corner * 6;
         o.color = float4(1, 1, 1, t.x);
-        o.extra = float4(u.time, radius, 0, 0);
+        o.extra = float4(u.time, radius, t.y, 0);
         return o;
     }
 
-    // A limb-darkened Sun with slowly boiling granulation and a soft corona.
-    fragment float4 sunFragment(GlowOut in [[stage_in]]) {
+    // The Sun: NASA's Solar Dynamics Observatory image of today (sunspots, plage and the real limb darkening), tinted
+    // from orange toward the white a 5,772 K surface really is, with a soft corona. Without it, a procedural disc.
+    fragment float4 sunFragment(GlowOut in [[stage_in]], texture2d<float> sun [[texture(0)]]) {
+        constexpr sampler s(filter::linear, mip_filter::linear, address::clamp_to_edge);
         float r = length(in.uv);
         float3 c = 0;
         if (r < 1.02) {
             float mu = sqrt(max(1 - r * r, 0.0));
-            float limb = 0.4 + 0.6 * pow(mu, 0.6);
-            float t = in.extra.x;
-            float g = fbm(float3(in.uv * 7.0, t * 0.05), 4);
-            c = float3(1.0, 0.68, 0.34) * limb * (0.8 + 0.4 * g) * 1.5 * smoothstep(1.02, 0.98, r);
+            float edge = smoothstep(1.02, 0.99, r);
+            if (in.extra.z > 0.5) {
+                float2 uv = float2(0.5 + in.uv.x * 0.4663, 0.5 - in.uv.y * 0.4663);
+                float3 photo = sun.sample(s, uv, level(max(log2(1024 * 0.4663 * 2 / max(in.extra.y * 2, 1.0)), 0.0))).rgb;
+                float i = photo.r;
+                c = i * mix(float3(1.0, 0.72, 0.42), float3(1.0, 0.93, 0.82), mu) * 1.5 * edge;
+            } else {
+                float limb = 1 - 0.6 * (1 - mu) - 0.2 * (1 - mu) * (1 - mu);
+                float g = fbm(float3(in.uv * 7.0, in.extra.x * 0.05), 4);
+                c = float3(1.0, 0.86, 0.66) * limb * (0.85 + 0.3 * g) * 1.6 * edge;
+            }
         }
-        float corona = exp(-(r - 1) * 2.2) * 0.35 + exp(-(r - 1) * 0.6) * 0.06;
-        float rays = 0.85 + 0.15 * noise(float2(atan2(in.uv.y, in.uv.x) * 5.0, in.extra.x * 0.03));
-        if (r >= 1) c += float3(1.0, 0.6, 0.28) * corona * rays;
+        float corona = exp(-(r - 1) * 3.0) * 0.12 + exp(-(r - 1) * 0.7) * 0.025;
+        float rays = 0.88 + 0.12 * noise(float2(atan2(in.uv.y, in.uv.x) * 5.0, in.extra.x * 0.03));
+        if (r >= 1) c += float3(1.0, 0.8, 0.55) * corona * rays;
         return float4(c * in.color.a * smoothstep(6.0, 4.0, r), 0);
     }
 
-    struct BodyIn { float4 pos; float4 light; float4 info; };
-    struct PlanetOut { float4 pos [[position]]; float2 uv; float4 light; float4 info; float span; float3 pole; };
+    struct BodyIn { float4 pos; float4 light; float4 info; float4 axis; float4 meridian; };
+    struct PlanetOut { float4 pos [[position]]; float2 uv; float4 light; float4 info; float4 axis; float3 meridian; float span; float2 flags; };
 
-    vertex PlanetOut planetVertex(uint vid [[vertex_id]], uint iid [[instance_id]], constant U &u [[buffer(0)]],
-                                  const device BodyIn *bodies [[buffer(1)]], constant float4 &pole [[buffer(2)]]) {
-        BodyIn b = bodies[iid];
+    vertex PlanetOut planetVertex(uint vid [[vertex_id]], constant U &u [[buffer(0)]], const device BodyIn *bodies [[buffer(1)]]) {
+        BodyIn b = bodies[int(u.pad.x + 0.5)];
         float2 corner = float2(vid & 1, vid >> 1) * 2 - 1;
         float3 p = viewOf(b.pos.xyz, u);
-        float radius = b.pos.w * 2.2 / p.z;
-        float span = abs(b.light.w - 5) < 0.5 ? 2.6 : 3.2;   // room for Saturn's rings, or a glow
+        float radius = b.pos.w * 0.9 * sqrt(2.2 / p.z);
+        float span = abs(b.light.w - 5) < 0.5 ? 2.5 : 1.15;   // room for Saturn's rings
         PlanetOut o;
         o.pos = pixelToClip(p.xy + corner * radius * span, u.res);
         o.uv = corner * span;
         o.light = b.light;
         o.info = b.info;
+        o.axis = b.axis;
+        o.meridian = b.meridian.xyz;
         o.span = radius;
-        o.pole = pole.xyz;
+        o.flags = u.pad;
         return o;
     }
 
-    // A small lit globe: bands for the giants, oceans and cloud for Earth, rings for Saturn, and a soft glow.
-    fragment float4 planetFragment(PlanetOut in [[stage_in]]) {
-        float2 q = in.uv;
-        float r2 = dot(q, q);
-        int kind = int(in.light.w + 0.5);
-        float aa = 1.5 / max(in.span, 1.0);
-        float disc = smoothstep(1 + aa, 1 - aa, sqrt(r2));
-        float3 n = float3(q, sqrt(max(1 - r2, 0.0)));
-        float lit = smoothstep(-0.1, 0.25, dot(n, in.light.xyz));
-        float3 base = in.info.rgb;
-        if (kind == 4 || kind == 5) {
-            float bands = sin(q.y * (kind == 4 ? 15.0 : 11.0) + noise(q * 4.0) * 1.2);
-            base *= 0.86 + 0.14 * bands;
-            if (kind == 4) base = mix(base, float3(0.8, 0.45, 0.32), smoothstep(0.12, 0.0, length(q - float2(0.32, -0.36))) * 0.6);
-        } else if (kind == 2) {
-            float land = smoothstep(0.52, 0.6, fbm(q * 2.6 + 4.0, 4));
-            float cloud = smoothstep(0.5, 0.75, fbm(q * 4.0 + 11.0, 4));
-            base = mix(mix(base, float3(0.35, 0.5, 0.28), land), float3(0.95), cloud * 0.8);
-        } else if (kind == 3) {
-            base *= 0.85 + 0.25 * fbm(q * 3.0 + 2.0, 3);
-        }
-        float3 c = base * (lit * 1.1 + 0.07) * disc;
-        float alpha = disc;
-        // Saturn's rings: where the view ray meets the ring plane, hidden behind the globe on the far side.
-        if (kind == 5) {
-            float3 n = in.pole;
-            float z = -(n.x * q.x + n.y * q.y) / (abs(n.z) > 0.05 ? n.z : 0.05);
-            float rr = length(float3(q, z));
-            // The faint C ring, the bright B ring, the Cassini division and the A ring.
-            float ring = smoothstep(1.2, 1.28, rr) * smoothstep(2.32, 2.24, rr);
-            ring *= mix(0.35, 1.0, smoothstep(1.45, 1.6, rr)) * (1 - 0.8 * smoothstep(0.06, 0.02, abs(rr - 1.98))) * mix(1.0, 0.75, step(2.02, rr));
-            ring *= 0.7;
-            if (z < 0 && r2 < 1) ring = 0;
-            float3 rc = float3(0.86, 0.78, 0.62) * 0.9;
-            c = rc * ring + c * (1 - ring);
-            alpha = ring + alpha * (1 - ring);
-        }
-        float glow = exp(-max(sqrt(r2) - 1, 0.0) * 2.6) * (1 - disc) * 0.45;
-        return float4(c + in.info.rgb * glow * 0.6, alpha * 0.98) * in.info.w;
-    }
+    constant float RING_IN = 1.11, RING_OUT = 2.33;
 
-    fragment float4 orreryTone(V in [[stage_in]], constant U &u [[buffer(0)]], texture2d<float> light [[texture(0)]],
-                               texture2d<float> glow [[texture(1)]]) {
-        constexpr sampler s(filter::linear, address::clamp_to_edge);
-        float3 c = light.sample(s, in.uv).rgb + glow.sample(s, in.uv).rgb * 0.5;
-        return float4(film(c), 1);
+    // A lit globe from its real map: Lambert light with the Sun's direction, Lommel-Seeliger for airless rock, a thin
+    // atmosphere at Earth's and Venus's limbs, ocean glint, and Saturn's rings that cast a shadow on the globe and
+    // receive the globe's.
+    fragment float4 planetFragment(PlanetOut in [[stage_in]], texture2d<float> map [[texture(0)]], texture2d<float> extra [[texture(1)]]) {
+        constexpr sampler s(filter::linear, mip_filter::linear, s_address::repeat, t_address::clamp_to_edge);
+        constexpr sampler strip(filter::linear, mip_filter::linear, s_address::clamp_to_edge, t_address::clamp_to_edge);
+        float2 q = in.uv;
+        float r = length(q);
+        int kind = int(in.light.w + 0.5);
+        bool textured = fmod(in.flags.y, 2.0) > 0.5, second = in.flags.y > 1.5;
+        float aa = 1.2 / max(in.span, 1.0);
+        float disc = smoothstep(1 + aa, 1 - aa, r);
+        float3 L = normalize(in.light.xyz);
+        float3 P = normalize(in.axis.xyz);
+        float3 n = float3(q, sqrt(max(1 - r * r, 0.0)));
+        float mu = n.z;
+        float3 e1 = normalize(in.meridian), e2 = cross(P, e1);
+        float lat = asin(clamp(dot(n, P), -1.0, 1.0));
+        float lon = atan2(dot(n, e2), dot(n, e1));
+        float2 uv = float2(0.5 + lon / TAU, 0.5 - lat / PI);
+        float lod = max(log2(float(map.get_width()) / (TAU * max(in.span, 1.0))) + 0.5, 0.0);
+        float3 albedo = textured ? map.sample(s, uv, level(lod)).rgb : in.info.rgb * (0.85 + 0.25 * fbm(q * 3.0 + 2.0, 3));
+        float sunlight = 1.6 / (1 + 0.2 * in.axis.w);
+
+        float cosL = dot(n, L);
+        float lit = max(cosL, 0.0);
+        if (kind == 0 || kind == 8) lit = lit / (lit + mu + 0.02) * 2.0;
+        if (kind == 1) lit = smoothstep(-0.3, 0.9, cosL) * 0.95;
+        if (kind >= 4 && kind <= 7) lit = smoothstep(-0.12, 0.6, cosL);
+        if (kind == 2 && second) {
+            float cloud = extra.sample(s, uv + float2(0.004 * sin(in.axis.w * 40.0), 0), level(lod)).r;
+            float ocean = smoothstep(0.0, 0.25, albedo.b - albedo.r - 0.02);
+            albedo = mix(albedo, float3(0.92, 0.94, 0.96), cloud * 0.85);
+            float3 H = normalize(L + float3(0, 0, 1));
+            float glint = pow(max(dot(n, H), 0.0), 90.0) * ocean * (1 - cloud) * 0.9;
+            albedo += glint / max(lit + 0.05, 0.05);
+        }
+        // Ring shadow on the globe: follow the light back to the ring plane.
+        if (kind == 5 && second && cosL > 0) {
+            float dl = dot(L, P);
+            if (abs(dl) > 0.02) {
+                float t = -dot(n, P) / dl;
+                if (t > 0) {
+                    float rho = length(n + L * t);
+                    if (rho > RING_IN && rho < RING_OUT) lit *= 1 - 0.85 * extra.sample(strip, float2((rho - RING_IN) / (RING_OUT - RING_IN), 0.5), level(0)).a;
+                }
+            }
+        }
+        float3 c = albedo * (lit * sunlight + 0.004);
+        if (kind == 2 || kind == 1) {
+            float rim = pow(1 - mu, 3.0) * smoothstep(-0.25, 0.4, cosL);
+            c += (kind == 2 ? float3(0.18, 0.4, 0.95) : float3(0.9, 0.78, 0.55)) * rim * (kind == 2 ? 0.7 : 0.35) * sunlight;
+        }
+        if (kind == 3) c += float3(0.9, 0.55, 0.35) * pow(1 - mu, 4.0) * 0.06 * smoothstep(-0.2, 0.5, cosL) * sunlight;
+        c *= disc;
+        float alpha = disc;
+
+        if (kind == 5 && second) {
+            float z = -(P.x * q.x + P.y * q.y) / (abs(P.z) > 0.04 ? P.z : 0.04);
+            float3 R = float3(q, z);
+            float rr = length(R);
+            if (rr > RING_IN && rr < RING_OUT && !(z < 0 && r < 1)) {
+                float4 t = extra.sample(strip, float2((rr - RING_IN) / (RING_OUT - RING_IN), 0.5), level(0));
+                float b = dot(R, L), h = b * b - (dot(R, R) - 1);
+                float shadow = b < 0 ? smoothstep(0.0, 0.08, h) : 0.0;
+                bool sunSide = dot(L, P) * P.z > 0;
+                float3 tint = float3(0.95, 0.84, 0.68);
+                float3 rc = tint * dot(t.rgb, float3(0.333)) * 4.2 * sunlight * (sunSide ? 1.0 : 0.5) * (1 - 0.97 * shadow);
+                float a = t.a * 0.96;
+                c = rc * a + c * (1 - a);
+                alpha = a + alpha * (1 - a);
+            }
+        }
+        return float4(c, alpha) * in.info.w;
     }
     """
 }

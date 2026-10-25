@@ -1,14 +1,14 @@
 import Metal
 
-/// Stable fluids (Jos Stam, 1999) on the GPU: semi-Lagrangian advection, vorticity confinement and a pressure
-/// projection by Jacobi iteration, on a 512 × 320 grid. Two slow stirrers and a faint drifting current keep the water
-/// moving; now and then a drop of indigo, vermilion or gold falls in with a little momentum and curls into a vortex pair.
-/// The ink rides on a finer 1024 × 640 grid with MacCormack advection so filaments stay sharp, and it is drawn as
-/// pigment, with Kubelka–Munk absorption and scattering, so mixed inks darken like paint instead of adding like light.
+/// A glass tank of still water seen from the side, backlit by a dim warm softbox, with drops of ink falling in. Stable
+/// fluids (Jos Stam, 1999) on the GPU in the vertical plane: semi-Lagrangian advection, vorticity confinement and a
+/// pressure projection by Jacobi iteration on a 512 × 320 grid, with buoyancy: ink is denser than water, so each drop
+/// sinks, rolls into a vortex ring and sheds plumes. The ink rides on a finer 1024 × 640 grid with MacCormack advection.
+/// It is drawn by Beer–Lambert absorption of the backlight, so mixed inks darken and blue with yellow turns green.
 @MainActor final class InkInWater: Scene {
     static let width = 512, height = 320
     static let iterations = 40
-    static let names = ["indigo", "vermilion", "gold"]
+    static let names = ["Prussian blue", "vermilion", "gold"]
 
     private let velocityStep: MTLComputePipelineState
     private let curlStep: MTLComputePipelineState
@@ -21,9 +21,9 @@ import Metal
     private let measure: MTLComputePipelineState
     private let clearAll: MTLComputePipelineState
     private let shade: MTLRenderPipelineState
-    private let show: MTLRenderPipelineState
-    private let bloom: Bloom
-    private let lit: MTLTexture
+    private var lit: MTLTexture?
+    private let gpu: GPU
+    private let lens: Lens
     private let velocity: [MTLTexture]
     private let pressure: [MTLTexture]
     private let divergence: MTLTexture
@@ -40,9 +40,9 @@ import Metal
     private var energy: Float = 0
     private var amounts = SIMD3<Float>(repeating: 0)
 
-    var scale: Float { 1 }
+    var scale: Float { 0.85 }
     var facts: String? {
-        var s = "Navier–Stokes fluid on a 512 by 320 grid, \(Self.iterations) pressure iterations a frame, 3 inks: indigo, vermilion and gold."
+        var s = "Navier–Stokes fluid on a 512 by 320 grid, \(Self.iterations) pressure iterations a frame, 3 inks: Prussian blue, vermilion and gold, falling through water in a glass tank."
         guard drops > 0 else { return s }
         s += " \(drops) \(drops == 1 ? "drop" : "drops") so far"
         if amounts.sum() > 0.002 {
@@ -65,15 +65,14 @@ import Metal
         measure = try gpu.kernel(library, "inkMeasure")
         clearAll = try gpu.kernel(library, "inkClear")
         shade = try gpu.pipeline(library, "inkShade")
-        show = try gpu.pipeline(library, "inkShow")
-        bloom = try Bloom(gpu: gpu)
+        lens = try Lens(gpu: gpu)
+        self.gpu = gpu
         let w = Self.width, h = Self.height
         velocity = [gpu.texture(w, h, .rg32Float), gpu.texture(w, h, .rg32Float)]
         pressure = [gpu.texture(w, h, .r32Float), gpu.texture(w, h, .r32Float)]
         divergence = gpu.texture(w, h, .r32Float)
         curl = gpu.texture(w, h, .r32Float)
         dye = (0..<3).map { _ in gpu.texture(2 * w, 2 * h, .rgba16Float) }
-        lit = gpu.texture(2 * w, 2 * h)
         stats = gpu.buffer(Self.blocks.0 * Self.blocks.1 * MemoryLayout<SIMD4<Float>>.stride)
     }
 
@@ -81,35 +80,19 @@ import Metal
         let t = f.time
         readStats()
 
-        // Two stirrers wander on slow, incommensurate loops, each fading in and out so the water has calm spells.
-        var stir: [SIMD4<Float>] = []
-        var active: [Float] = []
-        for k in 0..<2 {
-            let p = Float(k) * 2.4 + f.seed
-            func at(_ t: Float) -> SIMD2<Float> {
-                SIMD2(256 + 170 * sin(t / 47 + p) + 50 * sin(t / 19 + 2 * p), 160 + 95 * sin(t / 61 + 1.7 * p) + 30 * cos(t / 23 + p))
-            }
-            let here = at(t)
-            let speed = (at(t + 0.5) - at(t - 0.5)) * 1.6
-            stir.append(SIMD4(here.x, here.y, speed.x, speed.y))
-            active.append(pow(sin(t / 37 + 1.9 * p) * 0.5 + 0.5, 2))
-        }
-
-        // Now and then a drop of ink, pushed in a random direction so it rolls up into a pair of vortices.
+        // A drop of ink every few seconds, released just under the surface with a downward push.
         var drop = SIMD4<Float>(-1000, -1000, 0, 0)
         var dropInfo = SIMD4<Float>(0, 0, 0, 0)
         if t >= nextDrop {
-            // Three drops in quick succession to open, then one every few seconds.
-            nextDrop = t + (drops < 2 ? 1.1 : .random(in: 3...7.5))
+            nextDrop = t + (drops < 2 ? 3.5 : .random(in: 7...14))
             var ink = Int.random(in: 0..<3)
             if ink == lastInk { ink = (ink + Int.random(in: 1...2)) % 3 }
             lastInk = ink
             drops += 1
-            let x = Float.random(in: 70...442), y = Float.random(in: 50...270)
-            let angle = Float.random(in: 0..<(2 * .pi))
-            let push = Float.random(in: 40...75)
+            let x = Float.random(in: 90...422), y = Float.random(in: 14...30)
+            let push = Float.random(in: 26...48)
             let radius = Float.random(in: 9...15)
-            drop = SIMD4(x, y, cos(angle) * push, sin(angle) * push)
+            drop = SIMD4(x, y, Float.random(in: -6...6), push)
             dropInfo = SIMD4(radius, Float(ink), .random(in: 0..<100), 1)
             if let synth = f.sound {
                 let notes: [Float] = [587.3, 659.3, 740.0, 880.0, 987.8, 1174.7]
@@ -119,9 +102,8 @@ import Metal
         }
 
         let w = Self.width, h = Self.height
-        var u = f.uniforms(stir[0], stir[1], drop, dropInfo)
+        var u = f.uniforms(.zero, .zero, drop, dropInfo)
         u.dt = min(f.dt, 1.0 / 30)
-        u.pad = SIMD2(active[0], active[1])
         guard let e = f.cmd.makeComputeCommandEncoder() else { return }
         let run = FieldDispatch(encoder: e)
         let (v0, v1) = (velocity[v], velocity[1 - v])
@@ -129,23 +111,25 @@ import Metal
             run(clearAll, w, h, u, [v0, pressure[0], pressure[1]])
             run(clearAll, 2 * w, 2 * h, u, [dye[0], dye[1], dye[2]])
         }
+        let (d0, d1, d2) = (dye[d], dye[(d + 1) % 3], dye[(d + 2) % 3])
         run(velocityStep, w, h, u, [v0, v1])
         run(curlStep, w, h, u, [v1, curl])
-        run(confine, w, h, u, [v1, curl, v0])
+        run(confine, w, h, u, [v1, curl, v0, d0])
         run(divergenceStep, w, h, u, [v0, divergence])
         for i in 0..<Self.iterations {
             run(jacobi, w, h, u, [pressure[i & 1], divergence, pressure[(i + 1) & 1]])
         }
         run(project, w, h, u, [v0, pressure[Self.iterations & 1], v1])
-        let (d0, d1, d2) = (dye[d], dye[(d + 1) % 3], dye[(d + 2) % 3])
         run(advectDye, 2 * w, 2 * h, u, [d0, v1, d1])
         run(correctDye, 2 * w, 2 * h, u, [d0, d1, v1, d2])
         run(measure, Self.blocks.0, Self.blocks.1, u, [v1, d2], buffers: [stats])
         e.endEncoding()
         v = 1 - v
         d = (d + 2) % 3
-        f.cmd.draw(shade, into: lit, uniforms: f.uniforms(res: SIMD2(Float(2 * w), Float(2 * h))), textures: [d2])
-        f.cmd.draw(show, into: f.target, uniforms: f.uniforms(), textures: [lit, bloom.glow(f.cmd, lit)])
+        let size = Int(f.size.x), rows = Int(f.size.y)
+        if lit == nil || lit!.width != size || lit!.height != rows { lit = gpu.texture(size, rows) }
+        f.cmd.draw(shade, into: lit!, uniforms: f.uniforms(), textures: [d2])
+        lens.develop(f, lit!, Lens.Look(exposure: 1.0, white: [1, 1, 1], bloom: 0.05, halation: 0.03, vignette: 0.3, aberration: 0.8, grain: 0.45))
 
         if let synth = f.sound { play(synth) }
     }
@@ -168,7 +152,7 @@ import Metal
     /// ink is in the water: indigo the low note, vermilion the middle, gold the top.
     private func play(_ synth: Synth) {
         // Mean kinetic energy runs from about 14 (cells per second, squared) in a calm spell to 45 while stirred.
-        let flow = min(max((energy.squareRoot() - 3) / 5, 0), 1)
+        let flow = min(max(energy.squareRoot() / 6, 0), 1)
         synth.noise(0.03 + 0.07 * flow, cutoff: 250 + 900 * flow)
         let notes: [Float] = [146.8, 220.0, 293.7]
         for i in 0..<3 {
@@ -198,27 +182,19 @@ import Metal
         a.write(float4(0), g); b.write(float4(0), g); c.write(float4(0), g);
     }
 
-    // Advects the velocity along itself (midpoint back-trace), damps it, and adds the stirrers, a faint drifting
-    // current and the push of a new drop. a, b: stirrers (position, velocity); pad: their strengths;
+    // Advects the velocity along itself (midpoint back-trace), damps it, and adds the push of a new drop.
     // c: drop position and push; d.x: drop radius.
     kernel void inkVelocity(constant U &u [[buffer(0)]], texture2d<float, access::read> vel [[texture(0)]],
                             texture2d<float, access::write> out [[texture(1)]], uint2 g [[thread_position_in_grid]]) {
         float2 x = float2(g) + 0.5;
         float2 v = vel.read(g).xy;
         float2 mid = bilerp(vel, x - 0.5 * u.dt * v).xy;
-        float2 w = bilerp(vel, x - u.dt * mid).xy * exp(-u.dt / 10.0);
+        float2 w = bilerp(vel, x - u.dt * mid).xy * exp(-u.dt / 7.0);
         // A touch of viscosity, which keeps grid-scale ripples from building up.
         int2 p = int2(g);
         float2 around = vel.read(uint2(cell(p + int2(1, 0)))).xy + vel.read(uint2(cell(p - int2(1, 0)))).xy
                       + vel.read(uint2(cell(p + int2(0, 1)))).xy + vel.read(uint2(cell(p - int2(0, 1)))).xy;
         w = mix(w, around * 0.25, min(u.dt * 3.0, 0.2));
-        for (int k = 0; k < 2; k++) {
-            float4 s = k == 0 ? u.a : u.b;
-            float2 dd = x - s.xy;
-            float fall = exp(-dot(dd, dd) / (2 * 30.0 * 30.0));
-            w += (s.zw - w) * fall * min(u.dt * 1.5, 1.0) * (k == 0 ? u.pad.x : u.pad.y);
-        }
-        w += curl(x / 160 + float2(u.time * 0.004, 7.3 + u.seed)) * u.dt * 0.9;
         float2 dd = x - u.c.xy;
         w += u.c.zw * exp(-dot(dd, dd) / (2 * u.d.x * u.d.x * 2.2));
         if (g.x == 0 || g.x == uint(GRID.x - 1)) w.x = 0;
@@ -237,14 +213,17 @@ import Metal
     // Vorticity confinement (Fedkiw, Stam and Jensen 2001): pushes swirls back up that numerical diffusion smears out.
     kernel void inkConfine(constant U &u [[buffer(0)]], texture2d<float, access::read> vel [[texture(0)]],
                            texture2d<float, access::read> vort [[texture(1)]], texture2d<float, access::write> out [[texture(2)]],
-                           uint2 g [[thread_position_in_grid]]) {
+                           texture2d<float, access::read> ink [[texture(3)]], uint2 g [[thread_position_in_grid]]) {
         int2 p = int2(g);
         float l = abs(vort.read(uint2(cell(p - int2(1, 0)))).x), r = abs(vort.read(uint2(cell(p + int2(1, 0)))).x);
         float t = abs(vort.read(uint2(cell(p - int2(0, 1)))).x), b = abs(vort.read(uint2(cell(p + int2(0, 1)))).x);
         float w = vort.read(g).x;
         float2 n = float2(r - l, b - t);
         n /= length(n) + 1e-5;
-        float2 v = vel.read(g).xy + u.dt * 0.12 * float2(n.y * w, -n.x * w);
+        float2 v = vel.read(g).xy + u.dt * 0.1 * float2(n.y * w, -n.x * w);
+        // Buoyancy: ink is denser than water, so it pulls its own water down (y runs down the grid).
+        float4 c = bilerp(ink, (float2(g) + 0.5) * 2);
+        v.y += u.dt * 20.0 * (c.x + c.y + c.z);
         out.write(float4(v, 0, 0), g);
     }
 
@@ -303,22 +282,17 @@ import Metal
         uint2 i = uint2(q);
         float4 a = dye.read(i), b = dye.read(i + uint2(1, 0)), e = dye.read(i + uint2(0, 1)), f = dye.read(i + uint2(1, 1));
         c = clamp(c, min(min(a, b), min(e, f)), max(max(a, b), max(e, f)));
-        // Ink fades slowly, faint haze faster, and the walls swallow what reaches them, so the water never silts up.
-        float2 edge = min(x, sz - x) / 24;
-        float wall = smoothstep(0.0, 1.0, min(edge.x, edge.y));
-        c = max(c * exp(-u.dt / 70.0) - u.dt * 0.0022, 0.0) * mix(1 - u.dt * 2, 1.0, wall);
+        // Over minutes the tank clears: ink thins out into faint haze that is slowly drained, so it never silts up.
+        c = max(c * exp(-u.dt / 45.0) - u.dt * 0.0016, 0.0);
+        // Ink that has sunk to the floor of the tank settles out and drains off faster.
+        c *= 1 - u.dt * 0.12 * smoothstep(0.8, 0.96, x.y / sz.y);
         float2 dd = x - u.c.xy * 2;
         float r = u.d.x * 2;
-        // Concentric rings, the way suminagashi marblers float ink, so the flow folds them into nested lines.
         float far = length(dd) / max(r, 1e-3);
-        float blob = 0.8 * exp(-far * far * 30) + 0.3 * smoothstep(1.05, 0.75, far);
-        for (int k = 0; k < 3; k++) {
-            float rk = 0.33 + 0.3 * k;
-            blob += exp(-(far - rk) * (far - rk) / 0.01);
-        }
+        float blob = smoothstep(1.0, 0.35, far);
         if (blob > 0.001) {
-            float ragged = 0.75 + 0.5 * noise(x / (r * 0.6) + u.d.z);
-            float amount = 2.4 * blob * ragged * u.d.w;
+            float ragged = 0.7 + 0.6 * noise(x / (r * 0.45) + u.d.z);
+            float amount = 6.0 * blob * ragged * u.d.w;
             int k = int(u.d.y);
             c += float4(k == 0 ? amount : 0, k == 1 ? amount : 0, k == 2 ? amount : 0, 0);
         }
@@ -335,62 +309,111 @@ import Metal
         out[g.y * 64 + g.x] = float4(e, ink);
     }
 
-    // Kubelka–Munk reflectance of a pigment layer over black, per channel, from absorption K and scattering S.
-    inline float3 kubelkaMunk(float3 K, float3 S) {
-        float3 bs = sqrt(K * K + 2 * K * S);
-        float3 t = tanh(bs);
-        return S * t / max((K + S) * t + bs, 1e-5);
+    // Backlight: a dim, warm softbox behind the tank, a little brighter in the middle and falling off at its edges.
+    inline float3 softbox(float2 p, float2 R, float2 c, float2 hsz) {
+        float2 q = (p - c) / hsz;
+        float edge = smoothstep(1.0, 0.55, max(abs(q.x), abs(q.y) * 1.05));
+        float centre = 1.0 - 0.28 * dot(q, q) * 0.5;
+        return float3(1.0, 0.76, 0.52) * (0.004 + 0.19 * edge * centre);
     }
 
-    // Cubic B-spline filtering from four bilinear taps, so the ink grid never shows when scaled up.
-    inline float4 smoothSample(texture2d<float> t, float2 uv) {
-        constexpr sampler s(filter::linear, address::clamp_to_edge);
-        float2 sz = float2(t.get_width(), t.get_height());
-        float2 p = uv * sz - 0.5, i = floor(p), f = p - i;
-        float2 w0 = (1 - f) * (1 - f) * (1 - f) / 6, w1 = (4 - 6 * f * f + 3 * f * f * f) / 6;
-        float2 w3 = f * f * f / 6, w2 = 1 - w0 - w1 - w3;
-        float2 s0 = w0 + w1, s1 = w2 + w3;
-        float2 c0 = (i - 0.5 + w1 / s0) / sz, c1 = (i + 1.5 + w3 / s1) / sz;
-        return (t.sample(s, float2(c0.x, c0.y)) * s0.x + t.sample(s, float2(c1.x, c0.y)) * s1.x) * s0.y
-             + (t.sample(s, float2(c0.x, c1.y)) * s0.x + t.sample(s, float2(c1.x, c1.y)) * s1.x) * s1.y;
+    // Beer–Lambert transmission of the three inks (per red, green and blue) at a dye concentration.
+    inline float3 inkTransmission(float3 c) {
+        const float3 K0 = float3(3.0, 2.0, 0.75);    // Prussian blue: passes blue, kills red
+        const float3 K1 = float3(0.25, 2.1, 4.6);    // vermilion: passes red
+        const float3 K2 = float3(0.15, 0.75, 5.2);   // gold: passes red and green
+        return exp(-2.1 * (c.x * K0 + c.y * K1 + c.z * K2));
     }
 
-    // The ink as pigment, lit from the upper left. Light reaching a point has already passed through the ink between
-    // it and the light, so clouds shade themselves and their folds read in depth.
+    // Looking through the front of the glass tank: ink in water, the glass edges, the meniscus, bubbles and dust.
     fragment float4 inkShade(V in [[stage_in]], constant U &u [[buffer(0)]], texture2d<float> dye [[texture(0)]]) {
         constexpr sampler s(filter::linear, address::clamp_to_edge);
-        float3 c = dye.sample(s, in.uv).rgb;
-        // Absorption and scattering of indigo, vermilion and gold, per red, green and blue.
-        const float3 K0 = float3(2.3, 1.8, 0.75), S0 = float3(0.25, 0.3, 0.55);
-        const float3 K1 = float3(0.12, 1.7, 3.6), S1 = float3(1.0, 0.45, 0.3);
-        const float3 K2 = float3(0.08, 0.5, 3.4), S2 = float3(1.0, 0.85, 0.35);
-        float3 K = c.x * K0 + c.y * K1 + c.z * K2;
-        float3 S = c.x * S0 + c.y * S1 + c.z * S2;
-        float3 R = kubelkaMunk(K, S);
+        float2 R = u.res, p = in.pos.xy;
+        float W = min(0.80 * R.x, 0.72 * R.y * 1.6), H = W / 1.6;
+        float2 mid = R * float2(0.5, 0.5);
+        float air = 0.09 * H, total = H + air;
+        float x0 = mid.x - W / 2, x1 = mid.x + W / 2;
+        float yt = mid.y - total / 2 - 0.02 * R.y, ys = yt + air, yb = yt + total;
+        float gt = 0.013 * H;
+        float2 boxC = float2(mid.x, (yt + yb) / 2), boxHalf = float2(W * 0.66, total * 0.72);
+        float3 L = softbox(p, R, boxC, boxHalf);
+        float3 col = L;
 
-        float2 texel = 1 / float2(dye.get_width(), dye.get_height());
-        float2 toward = normalize(float2(-0.55, -0.85)) * texel * 3.5;
-        float3 depth = 0;
-        for (int i = 1; i <= 6; i++) depth += dye.sample(s, in.uv + toward * (float(i) + 0.5 * hash12(in.pos.xy))).rgb;
-        float3 shadow = exp(-(depth.x * (K0 + S0) + depth.y * (K1 + S1) + depth.z * (K2 + S2)) * 0.07);
+        float ground = max(p.y - (yb + 1.9 * gt), 0.0);
+        if (p.y > yb + 1.9 * gt) {
+            // The table: dark, with a faint blurred reflection of the softbox.
+            float refl = exp(-ground / (0.05 * R.y)) * smoothstep(x0 - gt - 0.1 * W, x0 + 0.1 * W, p.x) * smoothstep(x1 + gt + 0.1 * W, x1 - 0.1 * W, p.x);
+            col = float3(1.0, 0.76, 0.52) * (0.003 + 0.05 * refl);
+        }
 
-        float hl = dot(dye.sample(s, in.uv - float2(texel.x * 1.5, 0)).rgb, 1), hr = dot(dye.sample(s, in.uv + float2(texel.x * 1.5, 0)).rgb, 1);
-        float ht = dot(dye.sample(s, in.uv - float2(0, texel.y * 1.5)).rgb, 1), hb = dot(dye.sample(s, in.uv + float2(0, texel.y * 1.5)).rgb, 1);
-        float3 n = normalize(float3(hl - hr, hb - ht, 1.6));
-        float3 L = normalize(float3(-0.5, 0.65, 0.6));
-        float spec = pow(max(dot(reflect(-L, n), float3(0, 0, 1)), 0.0), 30.0) * 0.08 * smoothstep(0.1, 0.8, dot(c, 1));
+        float wall = min(p.x - x0, x1 - p.x);
+        float menisc = 0.012 * H * exp(-max(wall, 0.0) / (0.012 * H));
+        float surf = ys - menisc;
+        bool insideX = p.x >= x0 && p.x <= x1;
+        float2 uvw = (p - float2(x0, ys)) / float2(W, H);
 
-        float2 q = in.uv - float2(0.4, 0.35);
-        float light = 1.6 * (1 - 0.55 * dot(q, q));
-        float3 water = float3(0.004, 0.008, 0.012) * (1.2 - dot(q, q));
-        float3 col = R * light * (0.18 + 0.82 * shadow) * (0.8 + 0.35 * dot(n, L)) + spec * shadow + water * exp(-(K + S) * 0.6);
-        return float4(col, 1);
-    }
-
-    fragment float4 inkShow(V in [[stage_in]], texture2d<float> lit [[texture(0)]], texture2d<float> glow [[texture(1)]]) {
-        constexpr sampler s(filter::linear, address::clamp_to_edge);
-        float3 c = smoothSample(lit, in.uv).rgb + glow.sample(s, in.uv).rgb * 0.18;
-        return float4(film(c), 1);
+        if (insideX && p.y >= yt && p.y <= yb) {
+            float3 water = L * 0.94;
+            if (p.y >= surf) {
+                // Refraction bends the backlight by the gradient of ink density, a little.
+                float2 tx = 1.5 / float2(dye.get_width(), dye.get_height());
+                float dl = dot(dye.sample(s, uvw - float2(tx.x, 0)).rgb, 1), dr = dot(dye.sample(s, uvw + float2(tx.x, 0)).rgb, 1);
+                float dt = dot(dye.sample(s, uvw - float2(0, tx.y)).rgb, 1), db = dot(dye.sample(s, uvw + float2(0, tx.y)).rgb, 1);
+                float2 bend = float2(dl - dr, dt - db) * 0.004;
+                float3 c = dye.sample(s, clamp(uvw + bend, 0.0, 1.0)).rgb;
+                float3 T = inkTransmission(c);
+                // Ink also scatters a little backlight forward, so thin veils glow rather than go grey.
+                float thin = 1 - dot(T, float3(0.33));
+                col = water * T + L * 0.05 * thin * float3(0.9, 0.8, 0.7) * (1 - 0.5 * thin);
+                // Brighter silvered band under the surface, and the bright line of the surface itself.
+                float below = p.y - surf;
+                col *= 1 + 0.35 * exp(-below / (0.012 * H));
+                col += L * 1.3 * exp(-below * below / 3.0);
+                // Bubbles stuck on the glass: a dark rim with a bright pinhole of focused backlight.
+                float cell = 0.05 * H;
+                float2 g = p / cell, id = floor(g);
+                float3 h = hash33(float3(id, 3.7));
+                if (h.x < 0.09) {
+                    float2 pos = (id + 0.25 + 0.5 * h.yz) * cell;
+                    float rr = (0.003 + 0.007 * h.y * h.y) * H;
+                    float d = length(p - pos) / rr;
+                    float rim = smoothstep(0.55, 0.95, d) * smoothstep(1.35, 1.0, d);
+                    float2 offs = (p - pos) / rr - float2(-0.3, -0.3);
+                    float spot = exp(-dot(offs, offs) * 9) * step(d, 1.0);
+                    col = col * (1 - 0.6 * rim) + L * (0.55 * spot + 0.08 * step(d, 1.0));
+                }
+            } else {
+                col = L * 0.98;
+            }
+            // Dust adrift in the light.
+            float2 dg = p / (0.09 * H);
+            float2 did = floor(dg);
+            float3 dh = hash33(float3(did, 9.1));
+            if (dh.x < 0.3) {
+                float2 pos = (did + 0.5 + 0.35 * sin(u.time * (0.05 + 0.04 * dh.y) + dh.yz * 40.0)) * 0.09 * H;
+                float2 dd = p - pos;
+                col += L * 0.22 * dh.z * exp(-dot(dd, dd) / 1.2);
+            }
+            // The softbox mirrored faintly in the front glass.
+            float sx = (p.x - x0) / W + 0.55 * (p.y - yt) / total;
+            col += float3(1.0, 0.85, 0.65) * 0.018 * (exp(-(sx - 0.55) * (sx - 0.55) / 0.003) + 0.5 * exp(-(sx - 0.66) * (sx - 0.66) / 0.0004));
+        } else if (p.x >= x0 - gt && p.x <= x1 + gt && p.y >= yt && p.y <= yb + 1.9 * gt) {
+            // Glass seen edge-on: thick, faintly green, lit from within by the backlight, with bright rims.
+            bool base = p.y > yb;
+            float inner = base ? p.y - yb : (p.x < x0 ? x0 - p.x : p.x - x1);
+            float thick = base ? 1.9 * gt : gt;
+            float k = inner / thick;
+            float3 edge = L * float3(0.5, 0.78, 0.66) * 0.85 + L * 0.2;
+            if (base) {
+                // The base shows the tank's contents dimly, upside down.
+                float3 c = dye.sample(s, float2(clamp(uvw.x, 0.0, 1.0), 1 - 0.5 * k)).rgb;
+                edge = mix(edge, L * float3(0.5, 0.78, 0.66) * inkTransmission(c), 0.55);
+            }
+            col = edge * (0.8 + 0.4 * k);
+            col += L * (0.9 * exp(-inner * inner / 2.0) + 1.1 * exp(-(thick - inner) * (thick - inner) / 1.5));
+            if (p.y < ys) col *= 0.9;
+        }
+        return float4(max(col, 0.0), 1);
     }
     """
 }

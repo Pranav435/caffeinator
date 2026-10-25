@@ -32,8 +32,7 @@ import Metal
     private let diffuse: MTLComputePipelineState
     private let zero: MTLComputePipelineState
     private let show: MTLRenderPipelineState
-    private let present: MTLRenderPipelineState
-    private let bloom: Bloom
+    private let lens: Lens
     private let agents: MTLBuffer
     private let counts: MTLBuffer
     private let turns: MTLBuffer
@@ -76,8 +75,7 @@ import Metal
         diffuse = try gpu.kernel(library, "slimeDiffuse")
         zero = try gpu.kernel(library, "slimeZero")
         show = try gpu.pipeline(library, "slimeShow")
-        present = try gpu.pipeline(library, "slimePresent")
-        bloom = try Bloom(gpu: gpu)
+        lens = try Lens(gpu: gpu)
         agents = gpu.buffer(Self.agents * MemoryLayout<SIMD4<Float>>.stride)
         counts = gpu.buffer(Self.width * Self.height * 4)
         turns = gpu.buffer(3 * 64 * 4)
@@ -136,8 +134,7 @@ import Metal
         e.endEncoding()
 
         f.cmd.draw(show, into: light!, uniforms: f.uniforms([tokyo, 0, 0, 0]), textures: [trail[0], sea, food])
-        let glow = bloom.glow(f.cmd, light!)
-        f.cmd.draw(present, into: f.target, uniforms: f.uniforms(), textures: [light!, glow])
+        lens.develop(f, light!, Lens.Look(exposure: 1.1, white: [1, 0.98, 0.95], bloom: 0.04, halation: 0.03, vignette: 0.35, aberration: 1.0, grain: 0.4))
 
         readActivity(slot: (slot + 1) % 3, steps: n)
         labels(f)
@@ -292,29 +289,108 @@ import Metal
         out.write(float4(min(t, 2000.0), flow, 0, 0), g);
     }
 
-    // Bioluminescence: the trail glows teal, the busy veins gold, and their cores nearly white.
+    // Slime mold on agar in a petri dish, from above under a macro lens. The trail field becomes a height field of
+    // yellow tubes: thick where the flow is strong, thin sheets at the growing front. Light comes from above left.
+    inline float slimeBody(texture2d<float> trail, float2 uv) {
+        constexpr sampler s(filter::linear, address::repeat);
+        float2 tf = trail.sample(s, uv).xy;
+        float tube = smoothstep(7.0, 34.0, tf.x);
+        float vein = 1 - exp(-tf.y / 8.0);
+        return tube * (0.6 + 0.55 * vein);
+    }
+
     fragment float4 slimeShow(V in [[stage_in]], constant U &u [[buffer(0)]], texture2d<float> trail [[texture(0)]],
                               texture2d<float> sea [[texture(1)]], texture2d<float> food [[texture(2)]]) {
         constexpr sampler s(filter::linear, address::repeat);
-        float2 tf = trail.sample(s, in.uv).xy;
-        float v = 1 - exp(-tf.x / 60);
-        float vein = 1 - exp(-tf.y / 12);
-        float3 teal = float3(0.0, 0.28, 0.30);
-        float3 gold = float3(1.0, 0.52, 0.1);
-        float3 c = teal * pow(v, 1.8) * 0.4 + gold * vein * vein * 0.6 + float3(1.0, 0.85, 0.6) * pow(vein, 14.0) * 0.3;
-        float2 q = in.uv - 0.5;
-        c += float3(0.003, 0.006, 0.008) * (1 - dot(q, q));
-        float wet = sea.sample(s, in.uv).x * u.a.x;
-        c = mix(c, float3(0.002, 0.008, 0.02), wet * 0.6);
-        float flake = food.sample(s, in.uv).x * u.a.x;
-        c += float3(1.0, 0.8, 0.5) * smoothstep(0.3, 1.0, flake) * 0.8;
-        return float4(c, 1);
-    }
+        float2 R = u.res, p = in.pos.xy, uv = in.uv;
+        float tokyo = u.a.x;
+        float2 mid = R * 0.5;
+        float rd = mix(0.42 * R.x, 0.62 * R.x, smoothstep(0.0, 1.0, tokyo));
+        float rw = 0.03 * R.y;
+        float r = length(p - mid);
+        float3 lamp = float3(1.0, 0.93, 0.8);
 
-    fragment float4 slimePresent(V in [[stage_in]], texture2d<float> light [[texture(0)]], texture2d<float> glow [[texture(1)]]) {
-        constexpr sampler s(filter::linear, address::clamp_to_edge);
-        float3 c = light.sample(s, in.uv).rgb + glow.sample(s, in.uv).rgb * 0.6;
-        return float4(film(c), 1);
+        // The table outside the dish: nearly black, with the dish's glow on it.
+        float3 col = float3(0.010, 0.008, 0.006) * (1.2 - 0.6 * smoothstep(rd, rd * 1.35, r));
+        float edge = rd - r;
+
+        if (edge > 0) {
+            // Agar: pale, translucent amber, mottled, a little darker toward the walls where it is shallower.
+            float mott = fbm(uv * float2(9, 5.6) * 2.0 + u.seed, 5);
+            float fine = noise(p / 2.3);
+            float3 agar = float3(0.56, 0.42, 0.23) * (0.88 + 0.28 * mott) * (0.96 + 0.06 * fine);
+            // A soft ring lamp reflected in the wet surface, and a broad pool of light.
+            float2 q = (p - mid) / R.y;
+            agar *= 0.55 + 0.75 * exp(-dot(q - float2(-0.08, -0.06), q - float2(-0.08, -0.06)) * 1.6);
+            float2 rq = (p - (mid + float2(-0.14, -0.2) * R.y)) / R.y;
+            float gloss = exp(-pow(abs(length(rq) - 0.18), 2) / 0.0009) * 0.05 + exp(-dot(rq, rq) / 0.03) * 0.025;
+            // Beads of condensation.
+            float cell = 0.017 * R.y;
+            float2 id = floor(p / cell);
+            float3 hh = hash33(float3(id, 5.3));
+            if (hh.x < 0.07) {
+                float2 c = (id + 0.2 + 0.6 * hh.yz) * cell;
+                float d = length(p - c) / (0.0014 * R.y * (1 + 2 * hh.y));
+                agar *= 1 - 0.3 * smoothstep(1.2, 0.8, d) * smoothstep(0.3, 0.9, d);
+                gloss += 0.5 * exp(-dot(p - c + float2(1.2), p - c + float2(1.2)) / 1.3) * step(d, 1.0);
+            }
+            // Meniscus: the agar creeps up the glass wall and catches the light.
+            float men = smoothstep(rw * 1.9, rw * 0.6, rd - r - rw * 0.2);
+            men = rd - r < rw * 2.2 ? smoothstep(rw * 2.2, rw, rd - r) : 0.0;
+            agar *= 1 - 0.35 * men;
+            col = agar * lamp;
+            col += lamp * gloss;
+            float seaMask = sea.sample(s, uv).x * tokyo;
+            col *= 1 - 0.25 * seaMask;
+
+            // Contact shadow of the slime on the agar, soft and offset away from the light.
+            float2 toward = float2(-0.0035, -0.0055);
+            float sh = slimeBody(trail, uv + toward) * 0.5 + slimeBody(trail, uv + toward * 2.4) * 0.5;
+            col *= 1 - 0.5 * saturate(sh);
+
+            // The slime. A height field from the trail; normals from its gradient; subsurface colour from thickness.
+            float h = slimeBody(trail, uv);
+            // Shuttle streaming: the tubes swell and slacken in slow waves that travel along the network.
+            h *= 1.0 + 0.1 * sin(18.0 * noise(uv * float2(7.0, 4.4) + 3.1) + 4.0 * noise(uv * float2(19, 12)) - u.time * 0.62);
+            float2 e = 1.6 / R;
+            float hx = slimeBody(trail, uv + float2(e.x, 0)) - slimeBody(trail, uv - float2(e.x, 0));
+            float hy = slimeBody(trail, uv + float2(0, e.y)) - slimeBody(trail, uv - float2(0, e.y));
+            float3 n = normalize(float3(-hx, -hy, 0.35));
+            float3 L = normalize(float3(-0.45, -0.55, 0.7));
+            float diff = saturate(dot(n, L)) * 0.6 + 0.55;
+            float spec = pow(saturate(dot(reflect(-L, n), float3(0, 0, 1))), 24.0) * 0.5;
+            float thick = saturate(h);
+            // Thin sheets are pale lemon; thick tubes deepen to saturated yellow-orange as the light travels further.
+            float3 thin = float3(0.95, 0.82, 0.20), deep = float3(0.92, 0.55, 0.03);
+            float3 body = mix(thin, deep, smoothstep(0.35, 1.0, thick) * 0.8);
+            body *= 0.55 + 0.45 * smoothstep(0.0, 0.5, noise(uv * float2(700, 440)) + 0.2);
+            float3 slime = body * diff * lamp * 0.9 + lamp * spec * 0.7;
+            float alpha = smoothstep(0.03, 0.4, h) * 0.97;
+            col = mix(col, slime, alpha);
+
+            // Oat flakes at the food sources.
+            float fo = food.sample(s, uv).x * tokyo;
+            float ragged = fo + 0.35 * (noise(uv * float2(900, 560)) - 0.5);
+            float flake = smoothstep(0.1, 0.17, ragged);
+            if (flake > 0) {
+                float tex = 0.85 + 0.3 * noise(uv * float2(2200, 1400));
+                float3 oat = float3(0.70, 0.56, 0.36) * tex * (0.7 + 0.5 * smoothstep(0.1, 0.5, fo));
+                float lit = 0.8;
+                col = mix(col, oat * lit * lamp, flake * 0.8);
+            }
+        }
+
+        // The dish: a glass wall seen from above, refracting its own ring of light, with bright inner and outer edges.
+        float wall = (rd - r) / rw;
+        if (wall > -0.05 && wall < 1.0) {
+            float k = saturate(wall);
+            col = mix(col, float3(0.05, 0.075, 0.07) * lamp, smoothstep(0.0, 0.3, 1 - k) * 0.0);
+            float line = exp(-pow(wall - 0.0, 2) / 0.004) * 0.9 + exp(-pow(wall - 1.0, 2) / 0.006) * 0.35;
+            float arc = 0.35 + 0.65 * pow(0.5 + 0.5 * dot(normalize(p - mid + 1e-3), normalize(float2(-1, -1.2))), 2.0);
+            col += lamp * line * arc * 0.35;
+            col = mix(col, col * 0.45 + float3(0.02, 0.03, 0.025), smoothstep(0.9, 0.5, wall) * smoothstep(0.0, 0.2, wall) * 0.6);
+        }
+        return float4(max(col, 0.0), 1);
     }
     """
 }

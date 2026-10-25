@@ -39,7 +39,8 @@ import simd
     private static let configURL = URL(string: "https://eyes.nasa.gov/dsn/config.xml")!
     private static let lightSpeed = 299_792.458
     private static let au = 149_597_870.7
-    static let bandColors: [String: SIMD3<Float>] = ["S": [1.0, 0.62, 0.28], "X": [0.32, 0.78, 1.0], "K": [0.78, 0.45, 1.0]]
+    /// Linear colours by band; the shader draws the same colours in display space.
+    static let bandColors: [String: SIMD3<Float>] = ["S": [1.0, 0.57, 0.26], "X": [0.32, 0.71, 1.0], "K": [0.67, 0.45, 1.0]]
     private static let defaultSites = [
         "gdscc": Site(code: "gdscc", name: "Goldstone", lat: 35.2443523, lon: -116.8895382),
         "mdscc": Site(code: "mdscc", name: "Madrid", lat: 40.2413554, lon: -4.2480085),
@@ -80,7 +81,7 @@ import simd
     private var voices = [Float](repeating: 220, count: Synth.partials)
 
     var scale: Float { 1 }
-    var ready: Bool { loaded && globe.lightsSettled }
+    var ready: Bool { loaded && globe.ready }
 
     var facts: String? {
         guard loaded else { return "Loading the Deep Space Network's live status from NASA." }
@@ -108,10 +109,10 @@ import simd
         globe = try Globe.shared(gpu)
         canvas = try Globe.Canvas(gpu: gpu)
         let library = try gpu.library(Globe.metal + Self.source)
-        beams = try gpu.pipeline(library, "ribbonFill", vertex: "beam", blend: .add)
-        photons = try gpu.pipeline(library, "photonFill", vertex: "photon", blend: .add)
-        dots = try gpu.pipeline(library, "dotFill", vertex: "dot", blend: .add)
-        rings = try gpu.pipeline(library, "ringFill", vertex: "scaleRing", blend: .add)
+        beams = try gpu.pipeline(library, "ribbonFill", vertex: "beam", blend: .alpha)
+        photons = try gpu.pipeline(library, "photonFill", vertex: "photon", blend: .alpha)
+        dots = try gpu.pipeline(library, "dotFill", vertex: "dot", blend: .alpha)
+        rings = try gpu.pipeline(library, "ringFill", vertex: "scaleRing", blend: .alpha)
         config.sites = Self.defaultSites
         featured = Snapshot.variant ?? Int.random(in: 0..<20)
         fetch()
@@ -305,21 +306,22 @@ import simd
         let toCam = SIMD3(cos(beta) * cos(lam), cos(beta) * sin(lam) * cos(e) - sin(beta) * sin(e), cos(beta) * sin(lam) * sin(e) + sin(beta) * cos(e))
         let camFixed = Self.fixed(toCam, gmst)
         let spot = Globe.latLon(camFixed)
-        var cam = Globe.Camera(lat: Float(spot.lat), lon: Float(spot.lon), distance: 20, zoom: 4.4, aspect: f.aspect, sun: sun)
+        var cam = Globe.Camera(lat: Float(spot.lat), lon: Float(spot.lon), distance: 20, zoom: 4.4, aspect: f.aspect, date: f.now)
         let pole = Self.fixed(SIMD3(0, -sin(e), cos(e)), gmst)
         let roll = atan2(-simd_dot(pole, cam.basis.columns.0), simd_dot(pole, cam.basis.columns.1))
-        cam = Globe.Camera(lat: Float(spot.lat), lon: Float(spot.lon), distance: 20, zoom: 4.4, roll: roll, aspect: f.aspect, sun: sun)
+        cam = Globe.Camera(lat: Float(spot.lat), lon: Float(spot.lon), distance: 20, zoom: 4.4, roll: roll, aspect: f.aspect, date: f.now)
         camera = cam
         let light = canvas.light(for: f)
         let view = canvas.camera(cam)
         var style = Globe.Style()
-        style.graticule = 0.6
-        style.stars = 0.8
-        style.atmosphere = 0.8
-        globe.draw(f.cmd, into: light, camera: view, style: style, time: f.time)
+        style.stars = 0.3
+        globe.refresh(f.now)
+        globe.draw(f.cmd, into: light, camera: view, style: style, date: f.now, time: f.time)
+        canvas.develop(f, Self.look)
 
+        // The rest is the instrument display, over the picture. Reference rings in the ecliptic plane: the Moon's
+        // distance, 1, 10 and 100 AU.
         let px = f.size.y / 1000
-        // Reference rings in the ecliptic plane: the Moon's distance, 1, 10 and 100 AU.
         if ringBuffer == nil {
             let e = Astro.rad(23.44)
             let ringList = [384_400.0, Self.au, 10 * Self.au, 100 * Self.au].map { km -> SIMD4<Float> in
@@ -327,7 +329,7 @@ import simd
             }
             ringBuffer = f.gpu.buffer(ringList)
         }
-        f.cmd.draw(rings, into: light, clear: false, uniforms: f.uniforms([px, Float(gmst), 0, 0]), buffers: [view, ringBuffer!],
+        f.cmd.draw(rings, into: f.target, clear: false, uniforms: f.uniforms([px, Float(gmst), 0, 0]), buffers: [view, ringBuffer!],
                    vertices: 128 * 6, instances: 4)
 
         // Beams and photons, one beam per dish and spacecraft.
@@ -350,14 +352,13 @@ import simd
         for site in config.sites.values { dotList.append(SIMD4(Globe.geo(site.lat, site.lon, 1.002), 3)) }
         if !beamList.isEmpty {
             let b = canvas.stream(0, beamList)
-            f.cmd.draw(beams, into: light, clear: false, uniforms: f.uniforms([px, f.time, 0, 0]), buffers: [view, b],
+            f.cmd.draw(beams, into: f.target, clear: false, uniforms: f.uniforms([px, f.time, 0, 0]), buffers: [view, b],
                        vertices: 32 * 6, instances: beamList.count)
-            f.cmd.draw(photons, into: light, clear: false, uniforms: f.uniforms([px, f.time, 0, 0]), buffers: [view, b],
+            f.cmd.draw(photons, into: f.target, clear: false, uniforms: f.uniforms([px, f.time, 0, 0]), buffers: [view, b],
                        vertices: 64, instances: beamList.count, primitive: .point)
         }
-        f.cmd.draw(dots, into: light, clear: false, uniforms: f.uniforms([px, f.time, 0, 0], SIMD4(sun, 0)), buffers: [view, canvas.stream(1, dotList)],
+        f.cmd.draw(dots, into: f.target, clear: false, uniforms: f.uniforms([px, f.time, 0, 0], SIMD4(sun, 0)), buffers: [view, canvas.stream(1, dotList)],
                    vertices: dotList.count, primitive: .point)
-        canvas.finish(f, globe: globe, bloom: 0.75)
 
         if let synth = f.sound { play(synth, f) }
         if f.time - lastOverlay >= 0.1 || f.index == 0 {
@@ -524,12 +525,16 @@ import simd
         s >= 7200 ? "\(EarthText.number(s / 3600)) h" : "\(Int((s / 60).rounded())) min"
     }
 
+    /// The Earth is small here, so a slightly longer exposure lets the Milky Way show.
+    private static let look = Lens.Look(exposure: 1.4, bloom: 0.03, halation: 0.012, vignette: 0.3, aberration: 0.8, grain: 0.4)
+
     private static let source = """
     struct Beam { float4 a; float4 b; float4 c; };
 
-    constant float3 bandColors[3] = { float3(1.0, 0.62, 0.28), float3(0.32, 0.78, 1.0), float3(0.78, 0.45, 1.0) };
+    // Display colours by band: S warm, X cool, Ka violet.
+    constant float3 bandColors[3] = { float3(1.0, 0.78, 0.55), float3(0.6, 0.86, 1.0), float3(0.84, 0.7, 1.0) };
 
-    // Each beam is 32 short pieces so the Earth can hide the part behind it. u.a: pixel scale, time
+    // Each beam is a hairline in 32 short pieces so the Earth can hide the part behind it. u.a: pixel scale, time
     vertex Ribbon beam(uint vid [[vertex_id]], uint iid [[instance_id]], constant U &u [[buffer(0)]], constant GlobeCamera &c [[buffer(1)]],
                        const device Beam *beams [[buffer(2)]]) {
         Beam b = beams[iid];
@@ -540,12 +545,11 @@ import simd
         float3 q = atB ? p1 : p0;
         float s = atB ? s1 : s0;
         float active = max(b.c.x, b.c.y);
-        float level = (0.06 + 0.2 * active) * (0.35 + 0.65 * pow(1 - s, 0.7)) * globeShown(q, c);
-        float4 color = float4(bandColors[int(b.a.w)] * level, 0);
-        return ribbon(corner, globeClip(p0, c), globeClip(p1, c), 1.5 * u.a.x, color, u.res);
+        float alpha = (0.18 + 0.32 * active) * (0.45 + 0.55 * pow(1 - s, 0.7)) * globeShown(q, c);
+        return ribbon(corner, globeClip(p0, c), globeClip(p1, c), 1.0 * u.a.x, float4(bandColors[int(b.a.w)], 1) * alpha, u.res);
     }
 
-    struct Photon { float4 pos [[position]]; float size [[point_size]]; float3 color; };
+    struct Photon { float4 pos [[position]]; float size [[point_size]]; float4 color; };
 
     // Photons crawl along each beam at a visual light speed: inward on downlinks, outward on uplinks, more of them for
     // a faster data rate.
@@ -563,18 +567,19 @@ import simd
         if (down) s = 1 - s;
         float3 q = mix(b.a.xyz, b.b.xyz, s);
         o.pos = globeClip(q, c);
-        o.size = 5.5 * u.a.x;
+        o.size = 4 * u.a.x;
         float edge = smoothstep(0.0, 0.04, s) * smoothstep(1.0, 0.96, s);
-        o.color = mix(bandColors[int(b.a.w)], float3(1), 0.35) * 0.9 * edge * globeShown(q, c);
+        o.color = float4(mix(bandColors[int(b.a.w)], float3(1), 0.4), 1) * 0.9 * edge * globeShown(q, c);
         return o;
     }
 
     fragment float4 photonFill(Photon in [[stage_in]], float2 pc [[point_coord]]) {
         float d = length(pc - 0.5) * 2;
-        return float4(in.color * (smoothstep(0.45, 0.1, d) + exp(-d * d * 6) * 0.25), 0);
+        float px = max(fwidth(d), 1e-3);
+        return in.color * (1 - smoothstep(0.42 - px, 0.42 + px, d));
     }
 
-    struct Dot { float4 pos [[position]]; float size [[point_size]]; float3 color; float kind; };
+    struct Dot { float4 pos [[position]]; float size [[point_size]]; float4 color; float kind; };
 
     // Spacecraft (0), planets (1), the Sun (2) and the network's sites (3). u.b: sun
     vertex Dot dot(uint i [[vertex_id]], constant U &u [[buffer(0)]], constant GlobeCamera &c [[buffer(1)]],
@@ -584,21 +589,30 @@ import simd
         o.pos = globeClip(p.xyz, c);
         o.kind = p.w;
         float shown = p.w > 2.5 ? globeFacing(p.xyz, c) : globeShown(p.xyz, c);
-        float sizes[4] = { 15, 9, 22, 13 };
+        float sizes[4] = { 14, 8, 12, 12 };
         o.size = sizes[int(p.w)] * u.a.x;
-        float3 colors[4] = { float3(1.0, 0.97, 0.92) * 1.3, float3(0.55, 0.6, 0.7) * 0.45, float3(1.0, 0.75, 0.4) * 0.7, float3(1.0, 0.85, 0.6) * 1.2 };
+        float4 colors[4] = { float4(0.95, 0.96, 0.97, 1) * 0.9, float4(0.75, 0.78, 0.82, 1) * 0.55, float4(1.0, 0.86, 0.6, 1) * 0.9,
+                             float4(1.0, 0.86, 0.66, 1) * 0.9 };
         o.color = colors[int(p.w)] * shown;
         if (shown <= 0) o.pos = float4(0, 0, -1, 1);
         return o;
     }
 
+    // Spacecraft get a small open square, like a tracking box; planets and the Sun a dot; sites a tick mark.
     fragment float4 dotFill(Dot in [[stage_in]], float2 pc [[point_coord]]) {
-        float d = length(pc - 0.5) * 2;
-        float fw = fwidth(d);
-        float core = smoothstep(in.kind == 2 ? 0.5 : 0.28, 0.05, d);
-        float ring = in.kind == 0 ? saturate(1 - abs(d - 0.8) / max(fw * 1.2, 1e-3)) * 0.35 : 0;
-        float halo = exp(-d * d * 4) * (in.kind == 2 ? 0.5 : 0.15);
-        return float4(in.color * (core + ring + halo), 0);
+        float2 p = (pc - 0.5) * 2, a = abs(p);
+        float px = max(fwidth(p.x), 1e-3) * 1.1;
+        float ink;
+        if (in.kind < 0.5) {
+            float box = max(a.x, a.y);
+            ink = (1 - smoothstep(0.0, px, abs(box - 0.62))) + (1 - smoothstep(0.12, 0.12 + px, length(p)));
+        } else if (in.kind < 2.5) {
+            ink = 1 - smoothstep((in.kind > 1.5 ? 0.6 : 0.42) - px, (in.kind > 1.5 ? 0.6 : 0.42) + px, length(p));
+        } else {
+            ink = (1 - smoothstep(0.0, px, a.x)) * step(a.y, 0.9) + (1 - smoothstep(0.0, px, a.y)) * step(a.x, 0.9);
+            ink *= step(0.3, max(a.x, a.y));
+        }
+        return in.color * saturate(ink);
     }
 
     // Faint dashed circles in the ecliptic plane at the scaled distances of the Moon, 1, 10 and 100 AU, turned with
@@ -616,14 +630,14 @@ import simd
         float cg = cos(g), sg = sin(g);
         float3 p0 = float3(cg * i0.x + sg * i0.y, -sg * i0.x + cg * i0.y, i0.z), p1 = float3(cg * i1.x + sg * i1.y, -sg * i1.x + cg * i1.y, i1.z);
         float3 q = atB ? p1 : p0;
-        float4 color = float4(float3(0.45, 0.55, 0.8) * 0.05 * globeShown(q, c), 0);
+        float4 color = float4(0.8, 0.84, 0.9, 1) * 0.22 * globeShown(q, c);
         Ribbon o = ribbon(corner, globeClip(p0, c), globeClip(p1, c), 1.0 * u.a.x, color, u.res);
         o.along = float(seg) + (atB ? 1 : 0);
         return o;
     }
 
     fragment float4 ringFill(Ribbon in [[stage_in]]) {
-        float dash = smoothstep(0.3, 0.4, fract(in.along * 0.5)) * smoothstep(1.0, 0.9, fract(in.along * 0.5));
+        float dash = step(0.5, fract(in.along * 0.5));
         return in.color * saturate(in.half_width + 0.5 - abs(in.across)) * dash;
     }
     """

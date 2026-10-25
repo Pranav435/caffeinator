@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import Metal
 
 /// Bert Chan's Lenia: a continuous cellular automaton whose gliders look alive. Each step convolves the field with a
@@ -6,6 +7,9 @@ import Metal
 /// dark sea, collide and dissolve; new ones drift in from a margin hidden past the screen's edges.
 @MainActor final class Lenia: Scene {
     private static let radius = 13
+    private static let look = Lens.Look(exposure: 1.3, white: [0.97, 1, 1.04], bloom: 0.07, halation: 0.03, vignette: 0.15, aberration: 2.4, grain: 0.9)
+    /// One grid cell in micrometres, for the scale bar: an orbium is about 120 µm across, a small ciliate's size.
+    private static let cellMicrons: Float = 6
     private static let mu: Float = 0.15
     private static let sigma: Float = 0.015
     private static let period: Float = 10
@@ -49,7 +53,7 @@ import Metal
     private let stampKernel: MTLComputePipelineState
     private let prepare: MTLComputePipelineState
     private let render: MTLRenderPipelineState
-    private let bloom: Bloom
+    private let lens: Lens
     private let taps: MTLBuffer
     private let tapCount: Int
     private let pattern: MTLBuffer
@@ -71,6 +75,7 @@ import Metal
     private var sinceSpawn: Float = 0
     private var sinceRead: Float = 0
     private var pendingRead = false
+    private var overlayAt: Float = -100
     private var mass: Float = 0
     private var motion: Float = 0
     private var breath: Float = 0
@@ -83,7 +88,7 @@ import Metal
 
     var facts: String? {
         let n = counted == 1 ? "1 orbium glider on screen" : "\(counted) orbium gliders on screen"
-        return "Lenia: \(n), kernel radius 13, growth centre μ 0.15, width σ 0.015, time step one tenth"
+        return "Lenia under a darkfield microscope, 10× objective: \(n), each about 120 micrometres across; kernel radius 13, growth centre μ 0.15, width σ 0.015, time step one tenth"
     }
 
     init(gpu: GPU) throws {
@@ -92,7 +97,7 @@ import Metal
         stampKernel = try gpu.kernel(library, "leniaStamp")
         prepare = try gpu.kernel(library, "leniaLook")
         render = try gpu.pipeline(library, "leniaRender")
-        bloom = try Bloom(gpu: gpu)
+        lens = try Lens(gpu: gpu)
         // The kernel: a smooth bump over a ring of radius R, normalised to sum to one.
         var list: [SIMD4<Float>] = []
         let r = Self.radius
@@ -176,11 +181,9 @@ import Metal
         let u = f.uniforms([clock, 1 - exp(-f.dt / 5), Float(Self.margin), Float(vw)], [Float(gw), Float(gh), Float(Self.visibleHeight), 0])
         f.cmd.compute(prepare, size.0, size.1, uniforms: u,
                       textures: [fields[previous], fields[current], look!, wake!, fields[(current + 1) % 3]])
-        f.cmd.draw(render, into: hdr!, uniforms: u, textures: [look!, wake!, look!, look!])
-        let glow = bloom.glow(f.cmd, hdr!)
-        f.cmd.draw(render, into: f.target, uniforms: f.uniforms([clock, 0, Float(Self.margin), Float(vw)],
-                                                                 [Float(gw), Float(gh), Float(Self.visibleHeight), 1]),
-                   textures: [look!, wake!, hdr!, glow])
+        f.cmd.draw(render, into: hdr!, uniforms: u, textures: [look!, wake!])
+        lens.develop(f, hdr!, Self.look)
+        drawOverlay(f)
 
         let s = stats[(steps + 1) % 2].contents().assumingMemoryBound(to: UInt32.self)
         if steps > 1 {
@@ -189,6 +192,27 @@ import Metal
         }
         census(f)
         if let synth = f.sound { play(synth, f) }
+    }
+
+    /// The microscope's readout: objective and contrast mode top left, a scale bar bottom left. It moves a little every
+    /// twenty seconds so nothing sits still for hours.
+    private func drawOverlay(_ f: Frame) {
+        guard f.time - overlayAt > 20 else { return }
+        overlayAt = f.time
+        let dx = CGFloat(10 * sin(f.time * 0.013)), dy = CGFloat(8 * sin(f.time * 0.017 + 1))
+        let microns = 100
+        f.overlay.draw { ctx, size in
+            let barWidth = size.height * CGFloat(Float(microns) / Self.cellMicrons / Float(Self.visibleHeight))
+            let left = size.width / 2 - size.height * 0.47 + 6 + dx, bottom = size.height - 64 + dy
+            let tint = NSColor(white: 1, alpha: 0.5)
+            ctx.setFillColor(tint.cgColor)
+            ctx.fill(CGRect(x: left, y: bottom, width: barWidth, height: 1.5))
+            ctx.fill(CGRect(x: left, y: bottom - 4, width: 1.5, height: 9.5))
+            ctx.fill(CGRect(x: left + barWidth - 1.5, y: bottom - 4, width: 1.5, height: 9.5))
+            ctx.text("\(microns) µm", at: CGPoint(x: left, y: bottom - 20), size: 11, weight: .medium, color: tint, tracking: 1)
+            ctx.text("DARKFIELD  ·  10×", at: CGPoint(x: left, y: size.height * 0.12 + dy), size: 10.5, weight: .medium,
+                     color: NSColor(white: 1, alpha: 0.38), tracking: 2)
+        }
     }
 
     /// Once a second, copies the field back to count creatures and find where they are; tops the population up
@@ -420,54 +444,75 @@ import Metal
              + (t.sample(s, float2(h0.x, h1.y)) * g0.x + t.sample(s, float2(h1.x, h1.y)) * g1.x) * g1.y;
     }
 
-    // Pass 1 (b.w = 0) lights the creatures into HDR; pass 2 (b.w = 1) adds the glow and tone maps.
-    // a: blend, wake fade, margin, visible width   b: grid size, visible height, pass
+    // Darkfield microscope: only light scattered by the specimen reaches the lens, so membranes (steep density) shine
+    // and the bulk is a faint haze. A ring of halo hugs each body, and the condenser lights the field unevenly.
+    // a: blend, wake fade, margin, visible width   b: grid size, visible height
     fragment float4 leniaRender(V in [[stage_in]], constant U &u [[buffer(0)]], texture2d<float> look [[texture(0)]],
-                                texture2d<float> wake [[texture(1)]], texture2d<float> hdr [[texture(2)]],
-                                texture2d<float> glow [[texture(3)]]) {
-        constexpr sampler ls(filter::linear, address::clamp_to_edge);
-        if (u.b.w > 0.5) {
-            float3 c = hdr.sample(ls, in.uv).rgb + glow.sample(ls, in.uv).rgb * 0.5;
-            return float4(film(c), 1);
-        }
+                                texture2d<float> wake [[texture(1)]]) {
+        constexpr sampler ls(filter::linear, address::repeat);
+        float2 gs = float2(u.b.x, u.b.y);
         float2 p = float2(u.a.z) + in.uv * float2(u.a.w, u.b.z);
         float4 f = smooth(look, p);
-        float trail = smooth(wake, p).r;
         float a = saturate(f.x);
         float2 grad = f.yz;
-
-        // Deep water: a faint glow from above and slow drifting motes.
         float2 c = centered(in.uv, u.res);
-        float3 col = mix(float3(0.001, 0.003, 0.007), float3(0.004, 0.012, 0.022), saturate(0.4 + 0.6 * c.y));
-        float n = fbm(float3(c * 1.6, u.time * 0.02), 3);
-        col *= 0.7 + 0.6 * n;
-        float2 mp = c * 38 + float2(u.time * 0.15, u.time * 0.4);
-        float2 cell = floor(mp), off = hash22(cell);
-        float mote = smoothstep(0.09, 0.0, length(fract(mp) - off * 0.8 - 0.1)) * step(0.82, hash12(cell + 7.1));
-        col += float3(0.05, 0.10, 0.12) * mote * (0.5 + 0.5 * sin(u.time * 0.7 + off.x * 40));
+        float r = length(c);
 
-        // The wake: a cool phosphorescent trail where creatures have passed.
-        col += float3(0.00, 0.07, 0.12) * pow(saturate(trail - a), 1.5) * 0.5;
+        // The field of view: a circle a little shorter than the screen, with a hotspot where the lamp is centred.
+        float2 hot = c - float2(-0.06, -0.04);
+        float lamp = 0.55 + 0.9 * exp(-dot(hot, hot) * 2.2);
+        float mott = 0.75 + 0.5 * fbm(float3(c * 2.2, 3.1 + u.time * 0.01), 4);
+        float3 col = float3(0.0022, 0.0042, 0.0075) * lamp * mott;
 
-        // The body: translucent membrane, luminous interior, a warm core. Growing edges glow cyan, the trailing
-        // edge where the creature dissolves glows violet.
-        // Two kinds of light, cyan and green-gold, drift across the sea so creatures change colour as they swim.
-        float kind = smoothstep(0.35, 0.65, noise(float3(p * 0.012, u.time * 0.008)));
-        float3 membrane = mix(float3(0.02, 0.35, 0.55), float3(0.10, 0.42, 0.22), kind);
-        float3 body = mix(float3(0.10, 0.65, 1.00), float3(0.40, 0.95, 0.45), kind);
-        float3 core = mix(float3(0.85, 1.00, 0.75), float3(1.00, 0.92, 0.60), kind);
-        float3 tint = mix(membrane, body, smoothstep(0.08, 0.5, a));
-        tint = mix(tint, core, smoothstep(0.6, 1.0, a));
-        float change = f.w * 12;
-        tint = mix(tint, float3(0.15, 1.0, 0.75), saturate(change) * 0.7);
-        tint = mix(tint, float3(0.75, 0.25, 1.0), saturate(-change) * 0.8);
-        float3 normal = normalize(float3(-grad * 9, 1));
-        float3 light = normalize(float3(-0.5, 0.6, 0.65));
-        float diffuse = saturate(dot(normal, light));
-        float spec = pow(saturate(dot(normal, normalize(light + float3(0, 0, 1)))), 40);
-        float rim = saturate(length(grad) * 7) * smoothstep(0.0, 0.15, a);
-        float3 lit = tint * (0.35 + 0.9 * diffuse) * pow(a, 1.1) * 1.3 + tint * rim * 0.6 + float3(0.8, 0.95, 1.0) * spec * a * 0.5;
-        col += lit;
+        // Out-of-focus debris: soft ringed discs of three sizes drifting at different depths, and sharp specks.
+        for (int k = 0; k < 3; k++) {
+            float sc = k == 0 ? 7.0 : k == 1 ? 13.0 : 26.0;
+            float2 mp = c * sc + float2(u.time * (0.05 + 0.03 * k), u.time * (0.11 - 0.03 * k)) + float(k) * 17.3;
+            float2 cell = floor(mp), fr = fract(mp);
+            float2 off = hash22(cell) * 0.5 + 0.25;
+            float present = step(k == 0 ? 0.55 : k == 1 ? 0.6 : 0.7, hash12(cell + 3.7));
+            float rad = (k == 0 ? 0.30 : k == 1 ? 0.2 : 0.1) * (0.6 + 0.6 * hash12(cell + 9.1));
+            float d = length(fr - off) / rad;
+            float disc = smoothstep(1.0, 0.85, d) * (0.45 + 0.9 * smoothstep(0.6, 1.0, d));
+            float soft = k == 2 ? exp(-d * d * 4) : disc;
+            col += float3(0.05, 0.085, 0.12) * soft * present * (k == 0 ? 0.16 : k == 1 ? 0.26 : 0.6) * lamp;
+        }
+        // A few fibres that pass through the field, slightly defocused.
+        float2 fp = float2(c.x * 0.8 + c.y * 0.6, -c.x * 0.6 + c.y * 0.8);
+        float fib = exp(-pow((fp.y - 0.12 * sin(fp.x * 3.1 + 1.0) + 0.18) * 120, 2)) * smoothstep(-0.25, 0.1, sin(fp.x * 1.7 + 2.0));
+        col += float3(0.025, 0.04, 0.06) * fib * 0.4;
+
+        // Halo: light refracted just outside each body, from the density averaged over a ring.
+        float ring = 0;
+        for (int i = 0; i < 8; i++) {
+            float an = float(i) * 0.7854;
+            float2 o = float2(cos(an), sin(an));
+            ring += look.sample(ls, (p + o * 3.2) / gs).r + look.sample(ls, (p + o * 6.4) / gs).r * 0.6;
+        }
+        ring /= 12.8;
+        float halo = saturate(ring - a * 0.7) * (1 - smoothstep(0.0, 0.25, a));
+
+        // The specimen. Oblique light makes one side of each membrane amber and the other blue-white.
+        float edge = length(grad);
+        float2 ld = normalize(float2(-0.6, -0.8));
+        float side = saturate(0.5 + 0.5 * dot(normalize(grad + 1e-5), ld) * smoothstep(0.0, 0.03, edge));
+        float3 cool = float3(0.55, 0.78, 1.0), warm = float3(1.0, 0.66, 0.30);
+        float3 membrane = mix(cool, warm, side * side);
+        float grain = 0.65 + 0.7 * fbm(float3(p * 0.55, 1.7), 3);
+        float speck = pow(saturate(noise(float3(p * 0.9, 4.2)) * 1.5 - 0.4), 2);
+        float3 specimen = membrane * edge * 1.4 * (0.55 + 0.45 * grain)
+                        + float3(0.26, 0.50, 0.70) * pow(a, 0.9) * 0.62 * grain
+                        + float3(0.7, 0.9, 1.0) * speck * a * 0.5;
+        float growth = saturate(f.w * 12);
+        specimen += float3(0.05, 0.30, 0.22) * growth * a * 0.5;
+        col += (specimen + float3(0.05, 0.13, 0.22) * halo * 1.6 + float3(0.01, 0.04, 0.07) * pow(saturate(smooth(wake, p).r - a), 1.5) * 0.6) * lamp;
+
+        // The iris: a crisp field stop with a faint bright lip where light scatters off its edge.
+        float R = 0.94;
+        float edgeMask = smoothstep(R, R - 0.007, r);
+        col *= edgeMask;
+        col += float3(0.012, 0.02, 0.03) * exp(-pow((r - R + 0.006) * 80, 2)) * edgeMask;
+        col += float3(0.0006, 0.0008, 0.0012) * (1 - edgeMask) * exp(-(r - R) * 4);
         return float4(col, 1);
     }
     """

@@ -130,26 +130,47 @@ import simd
         var lit = 0.0
         var waxing = true
         var lst = 0.0
+        /// Where J2000's x, y and z axes point in the horizon frame.
+        var eq: [SIMD3<Float>] = []
         var planets: [(name: String, alt: Double, az: Double, mag: Float, color: SIMD3<Float>)] = []
     }
 
     private let gpu: GPU
-    private let lutPass: MTLRenderPipelineState
+    private let transPass: MTLRenderPipelineState
+    private let multiPass: MTLRenderPipelineState
+    private let viewKernel: MTLComputePipelineState
+    private let ambientKernel: MTLComputePipelineState
+    private let noiseKernel: MTLComputePipelineState
+    private let weatherKernel: MTLComputePipelineState
+    private let cloudPass: MTLRenderPipelineState
     private let skyPass: MTLRenderPipelineState
     private let starPass: MTLRenderPipelineState
     private let frontPass: MTLRenderPipelineState
-    private let finishPass: MTLRenderPipelineState
+    private let glassPass: MTLRenderPipelineState
     private let meterPass: MTLComputePipelineState
     private let meter: MTLBuffer
+    private let ambient: MTLBuffer
+    private let bloom: Bloom
+    private let lens: Lens
     private var exposureNow: Double = 0
     /// How far the wind has carried the clouds, in kilometres east and north.
     private var drift = SIMD2<Float>(0, 0)
-    private let bloom: Bloom
-    private var lut: MTLTexture?
+    private var trans: MTLTexture
+    private var multi: MTLTexture
+    private var view: MTLTexture
+    private var haze: MTLTexture
+    private var noise: MTLTexture
+    private var cloudWeather: MTLTexture
+    private var clouds: [MTLTexture] = []
+    private var cloudFrame = 0
     private var hdr: MTLTexture?
+    private var lit: MTLTexture?
+    private var milky: MTLTexture?
+    private var moonMap: MTLTexture?
     private var weather: Weather?
     private var fetched = Date.distantPast
     private var attempted = false
+    private var imagesDone = false
     private let preset: Preset?
     private var offset: TimeInterval = 0
     private var sky = Sky()
@@ -160,28 +181,68 @@ import simd
     private var flash: Float = 0
     private var nextFlash: Float = 8
     private var thunderAt: Float = -1
+    private var flashAt = SIMD2<Float>(0, 3)
     private var crickets: [(next: Float, pulses: Int, pulseAt: Float)] = [(0.4, 0, 0), (0.9, 0, 0)]
 
-    var scale: Float { 0.6 }
-    var ready: Bool { attempted }
+    var scale: Float { 0.5 }
+    var ready: Bool { attempted && imagesDone }
+    var credit: String? {
+        var parts: [String] = []
+        if milky != nil { parts.append(MilkyWay.credit) }
+        if moonMap != nil { parts.append("Moon: NASA/GSFC/Arizona State University (LRO)") }
+        parts.append("Weather: Open-Meteo.com")
+        return parts.joined(separator: " · ")
+    }
+
+    private static let moonURL = URL(string: "https://svs.gsfc.nasa.gov/vis/a000000/a004700/a004720/lroc_color_poles_2k.tif")!
 
     init(gpu: GPU) throws {
         self.gpu = gpu
         let library = try gpu.library(SkyKit.metal + Self.source)
-        lutPass = try gpu.pipeline(library, "skyLUT")
+        transPass = try gpu.pipeline(library, "atmTrans")
+        multiPass = try gpu.pipeline(library, "atmMulti")
+        viewKernel = try gpu.kernel(library, "atmView")
+        ambientKernel = try gpu.kernel(library, "atmAmbient")
+        noiseKernel = try gpu.kernel(library, "cloudNoise")
+        weatherKernel = try gpu.kernel(library, "cloudWeather")
+        cloudPass = try gpu.pipeline(library, "cloudMarch")
         skyPass = try gpu.pipeline(library, "skyBase")
         starPass = try gpu.pipeline(library, "sprite", vertex: "skyStar", blend: .add)
         frontPass = try gpu.pipeline(library, "skyFront", blend: .alpha)
-        finishPass = try gpu.pipeline(library, "skyFinish")
+        glassPass = try gpu.pipeline(library, "skyGlass")
         meterPass = try gpu.kernel(library, "skyMeter")
         meter = gpu.buffer(16)
+        ambient = gpu.buffer(64)
         bloom = try Bloom(gpu: gpu)
+        lens = try Lens(gpu: gpu)
+        trans = gpu.texture(256, 64)
+        multi = gpu.texture(32, 32)
+        view = gpu.texture(192, 120)
+        haze = Self.volume(gpu, 192, 120, 16)
+        noise = Self.volume(gpu, 128, 128, 128)
+        cloudWeather = gpu.texture(256, 256)
         Location.shared.request()
         if let v = Snapshot.variant, v > 0 {
             preset = Self.presets[(v - 1) % Self.presets.count]
         } else {
             preset = nil
         }
+        Task { @MainActor [weak self] in
+            self?.milky = await MilkyWay.texture(gpu)
+            self?.moonMap = await Imagery.texture(Self.moonURL, gpu, maxSize: 2048, maxAge: 365 * 86400)
+            self?.imagesDone = true
+        }
+    }
+
+    /// A 3D half-float texture the shaders write and sample.
+    private static func volume(_ gpu: GPU, _ w: Int, _ h: Int, _ d: Int) -> MTLTexture {
+        let desc = MTLTextureDescriptor()
+        desc.textureType = .type3D
+        desc.pixelFormat = .rgba16Float
+        desc.width = w; desc.height = h; desc.depth = d
+        desc.usage = [.shaderRead, .shaderWrite]
+        desc.storageMode = .private
+        return gpu.device.makeTexture(descriptor: desc)!
     }
 
     // MARK: Data
@@ -249,19 +310,24 @@ import simd
         }
         sky = s
 
-        // Stars and planets as directions (x east, y up, z north), magnitude, colour index.
-        var points: [SIMD4<Float>] = []
-        for star in SkyStars.all {
-            let h = Astro.horizontal(Astro.Equatorial(ra: star.ra * 15, dec: star.dec, distance: 1), date, latitude: lat, longitude: lon)
-            points.append(SIMD4(Self.direction(h.alt, h.az), Float(star.mag)))
-            points.append(SIMD4(Float(star.bv), 0, 0, 0))
+        // The J2000 axes in the horizon frame, so the catalogue and the Milky Way photograph can stay in J2000.
+        for (ra, dec) in [(0.0, 0.0), (90.0, 0.0), (0.0, 90.0)] {
+            let h = Astro.horizontal(Astro.Equatorial(ra: ra, dec: dec, distance: 1), date, latitude: lat, longitude: lon)
+            sky.eq.append(Self.direction(h.alt, h.az))
         }
+        // Stars as J2000 directions with magnitude and colour index, then the planets in the horizon frame.
+        var points = Self.catalogue
         for p in s.planets {
             points.append(SIMD4(Self.direction(p.alt, p.az), p.mag))
             points.append(SIMD4(p.color, 1))
         }
         stars = gpu.buffer(points)
         starCount = points.count / 2
+    }
+
+    private static let catalogue: [SIMD4<Float>] = SkyCatalog.stars.flatMap { star -> [SIMD4<Float>] in
+        let v = SkyCatalog.unit(ra: Double(star.ra), dec: Double(star.dec))
+        return [SIMD4(Float(v.x), Float(v.y), Float(v.z), star.mag), SIMD4(star.bv, 0, 0, 0)]
     }
 
     /// A unit vector toward an altitude and azimuth: x east, y up, z north.
@@ -369,8 +435,12 @@ import simd
         let w = weather ?? Weather()
         let s = sky
         let size = (f.target.width, f.target.height)
-        if hdr?.width != size.0 || hdr?.height != size.1 { hdr = f.gpu.texture(size.0, size.1) }
-        if lut == nil { lut = f.gpu.texture(200, 125) }
+        if hdr?.width != size.0 || hdr?.height != size.1 {
+            hdr = f.gpu.texture(size.0, size.1)
+            lit = f.gpu.texture(size.0, size.1)
+            clouds = (0..<2).map { _ in f.gpu.texture(max(size.0 * 2 / 5, 1), max(size.1 * 2 / 5, 1)) }
+            cloudFrame = 0
+        }
 
         // Look toward the Sun by day and twilight, toward the Moon by night, otherwise toward the equator.
         let target = s.sun.alt > -12 ? s.sun.az : s.moon.alt > 4 ? s.moon.az : (Location.shared.latitude >= 0 ? 180 : 0)
@@ -384,13 +454,13 @@ import simd
         let az = Float(camera! * .pi / 180)
         // Tilt up a little to keep a high Moon in the window.
         let lookUp = s.sun.alt < -12 && s.moon.alt > 4 ? min(max(s.moon.alt - 36, 0), 7) : 0
-        let pitch = Float((20 + lookUp + 1.2 * sin(Double(f.time) / 300)) * .pi / 180)
+        let pitch = Float((21.5 + lookUp + 1.2 * sin(Double(f.time) / 300)) * .pi / 180)
         let focal = Float(1 / tan(27.5 * .pi / 180) - 0.035 * lookUp)
 
         let overcast = max(w.low, w.mid * 0.7)
         // Exposure adapts like an eye to the sky's measured brightness, aiming lower at night so night stays night.
         let moonUp = s.moon.alt > 0 ? s.lit : 0
-        let key = 0.06 + 0.05 * moonUp + (0.32 - 0.06 - 0.05 * moonUp) * Self.smooth(-9, 6, s.sun.alt)
+        let key = 0.035 + 0.05 * moonUp + (0.32 - 0.035 - 0.05 * moonUp) * Self.smooth(-9, 6, s.sun.alt)
         let measured = Double(meter.contents().load(as: Float.self))
         let wanted = measured > 0 && f.index > 1 ? key / measured : Self.exposure(sun: s.sun.alt, overcast: overcast)
         exposureNow = exposureNow == 0 ? wanted : exp(log(exposureNow) + (log(wanted) - log(exposureNow)) * (1 - exp(-Double(f.dt) / 0.7)))
@@ -399,24 +469,14 @@ import simd
         let haze = min(1 + 2 * w.fog + max(0, (w.humidity - 70) / 30), 2.5)
         // Moonlight is about 2.5 millionths of sunlight at full Moon; the sky gets a perceptual boost so moonlit nights read as brighter.
         let moonIllum = 2.5e-6 * pow(s.lit, 1.6)
-        // The light that falls on each cloud layer: sunlight, or moonlight once the Sun is well down.
         let sunUp = s.sun.alt > -8
-        let lightAlt = sunUp ? s.sun.alt : s.moon.alt
-        let lightScale = sunUp ? 1.0 : moonIllum
-        // Each layer's light is taken just before its shadow line; the shader decides per cloud whether the Sun has set there.
-        func light(_ h: Double) -> SIMD4<Float> {
-            let dip = (2 * h / 6360).squareRoot() * 180 / .pi
-            let t = Self.transmittance(height: h, elevation: max(lightAlt, -dip + 0.3), haze: haze) * lightScale
-            return SIMD4(Float(t.x), Float(t.y), Float(t.z), 0)
-        }
         let sunDir = Self.direction(s.sun.alt, s.sun.az), moonDir = Self.direction(s.moon.alt, s.moon.az)
-        let lightDir = sunUp ? sunDir : moonDir
-        let ground = Self.transmittance(height: 0.05, elevation: s.sun.alt, haze: haze)
+        let lightDir = sunUp || s.moon.alt < 0 ? sunDir : moonDir
 
-        // Wind: clouds drift toward where the wind blows, faster aloft than at ground level.
+        // Wind: clouds drift toward where the wind blows (the shader looks up the pattern behind each point).
         let toward = (w.windFrom + 180) * .pi / 180
         let speed = w.wind / 3.6 / 1000 * 1.6
-        drift += SIMD2(Float(sin(toward) * speed), Float(cos(toward) * speed)) * f.dt
+        drift -= SIMD2(Float(sin(toward) * speed), Float(cos(toward) * speed)) * f.dt
         let rain = Float(w.rainIntensity), snow = Float(w.snowIntensity), fog = Float(w.fog)
 
         // Lightning in a thunderstorm: a soft glow inside the clouds every half minute or so, never a strobe.
@@ -424,39 +484,99 @@ import simd
             if f.time > nextFlash {
                 nextFlash = f.time + Float.random(in: 18...45)
                 flash = 1
+                flashAt = SIMD2(Float.random(in: -6...6), Float.random(in: 1...8))
                 thunderAt = f.time + Float.random(in: 2.5...7)
             }
             flash = max(0, flash - f.dt / 1.4)
         }
         let night = Float(max(0, min(1, (-s.sun.alt - 4) / 10)))
         let hour = Float(Calendar.current.component(.hour, from: date)) + Float(Calendar.current.component(.minute, from: date)) / 60
+
+        // The kind of low cloud the weather reports, and where its base sits.
+        let wet = rain > 0 || snow > 0
+        let kind: Float = w.thunder ? 3 : wet && w.low > 0.6 ? 2 : w.low > 0.85 ? 1 : 0
+        let (base, thick): (Float, Float) = switch kind {
+        case 3: (1.0, 6.0)
+        case 2: (0.5, 1.8)
+        case 1: (1.0, 0.9)
+        default: (1.4, 1.6)
+        }
+        let lowCover = Float(wet ? max(w.low, 0.9) : w.low)
+        let groundAlbedo: Float = w.temperature < 0 && snow > 0 || (w.temperature < 1 && w.snowIntensity > 0) ? 0.7 : 0.2
+        let mist = Float(max(0, min(1, (12 - w.temperature) / 8)) * max(0, min(1, (w.humidity - 75) / 20))) * (rain > 0 ? 0 : 0.8)
+        let lamp = SIMD3<Float>(1.0, 0.66, 0.38) * 0.012 * night
         let params: [SIMD4<Float>] = [
             [az, pitch, focal, exposure],
             SIMD4(sunDir, 20),
             SIMD4(moonDir, s.sun.alt > -4 || s.moon.alt < -5 ? 0 : Float(moonIllum * 20 * 6)),
-            [Float(s.lit), Float(0.8 * .pi / 180), s.waxing ? 1 : -1, Float(Location.shared.latitude * .pi / 180)],
-            SIMD4(Float(ground.x), Float(ground.y), Float(ground.z), 0),
-            light(1.5), light(4), light(9),
-            SIMD4(lightDir, sunUp ? 1 : 0),
-            [Float(w.low), Float(w.mid), Float(w.high), w.thunder ? 0.8 : rain > 0.3 ? 0.6 : snow > 0.3 ? 0.35 : 0],
+            [Float(s.lit), Float(0.26 * .pi / 180), s.waxing ? 1 : -1, Float(Location.shared.latitude * .pi / 180)],
+            [Float(0.0045 * haze), 0.01, groundAlbedo, 1.2],
+            [lowCover, Float(w.mid), Float(w.high), w.thunder ? 0.8 : rain > 0.3 ? 0.6 : snow > 0.3 ? 0.35 : 0],
+            [base, thick, kind, kind == 0 ? 0.5 : 0.3],
             [drift.x, drift.y, Float(toward), Float(w.wind)],
             [rain, snow, fog, flash],
-            [night * (1 - Float(overcast) * 0.85), Float(s.lst * .pi / 180), Float(haze), hour],
-            [Float(Location.shared.latitude * 7.3 + Location.shared.longitude * 3.1).truncatingRemainder(dividingBy: 97), 0, 0, 0],
+            [night * (1 - Float(overcast) * 0.85), 0.4, mist, hour],
+            [Float(Location.shared.latitude * 7.3 + Location.shared.longitude * 3.1).truncatingRemainder(dividingBy: 97), 1, flashAt.x, flashAt.y],
+            SIMD4(s.eq.count == 3 ? s.eq[0] : [1, 0, 0], 0), SIMD4(s.eq.count == 3 ? s.eq[1] : [0, 1, 0], 0),
+            SIMD4(s.eq.count == 3 ? s.eq[2] : [0, 0, 1], 0),
+            SIMD4(lamp, 0.05),
+            [night * 0.9, 0.6, 4.2, 1],
+            SIMD4(lightDir, sunUp || s.moon.alt < 0 ? 1 : 0),
         ]
         let p = f.gpu.buffer(params)
         let u = f.uniforms()
-        f.cmd.draw(lutPass, into: lut!, uniforms: f.uniforms(res: SIMD2(Float(f.target.width), Float(f.target.height))), buffers: [p])
-        f.cmd.compute(meterPass, 1, uniforms: u, textures: [lut!], buffers: [p, meter])
-        f.cmd.draw(skyPass, into: hdr!, uniforms: u, textures: [lut!], buffers: [p])
-        if let stars, starCount > 0 {
-            f.cmd.draw(starPass, into: hdr!, clear: false, uniforms: u, buffers: [p, stars], vertices: starCount, primitive: .point)
+        let cmd = f.cmd
+
+        // Atmosphere tables, then the sky along each view ray and the light falling on the scene.
+        // The sky changes over minutes, so the tables and the light are refreshed only now and then.
+        if f.index % 90 == 0 {
+            cmd.draw(transPass, into: trans, uniforms: u, buffers: [p])
+            cmd.draw(multiPass, into: multi, uniforms: u, textures: [trans], buffers: [p])
         }
-        f.cmd.draw(frontPass, into: hdr!, clear: false, uniforms: u, textures: [lut!], buffers: [p])
-        let glow = bloom.glow(f.cmd, hdr!)
-        f.cmd.draw(finishPass, into: f.target, uniforms: u, textures: [hdr!, glow], buffers: [p])
+        if f.index % 3 == 0 {
+            cmd.compute(viewKernel, view.width, view.height, uniforms: u, textures: [trans, multi, view, self.haze], buffers: [p])
+        }
+        if f.index % 15 == 1 || f.index < 3 {
+            cmd.compute(ambientKernel, 1, uniforms: u, textures: [trans, multi], buffers: [p, ambient])
+        }
+        cmd.compute(meterPass, 1, uniforms: u, textures: [view], buffers: [p, meter])
+        if f.index == 0 { bakeNoise(f) }
+
+        // Clouds at half resolution, blended with the last frames.
+        let now = clouds[cloudFrame % 2], before = clouds[(cloudFrame + 1) % 2]
+        cmd.draw(cloudPass, into: now, uniforms: f.uniforms([cloudFrame > 0 ? 1 : 0, 0, 0, 0], res: SIMD2(Float(now.width), Float(now.height))),
+                 textures: [noise, cloudWeather, trans, self.haze, before], buffers: [p, ambient])
+        cloudFrame += 1
+
+        let dummy = dummyTexture(f.gpu)
+        cmd.draw(skyPass, into: hdr!, uniforms: u, textures: [view, trans, milky ?? dummy, moonMap ?? dummy], buffers: [p])
+        if let stars, starCount > 0 {
+            cmd.draw(starPass, into: hdr!, clear: false, uniforms: u, textures: [trans], buffers: [p, stars], vertices: starCount, primitive: .point)
+        }
+        cmd.draw(frontPass, into: hdr!, clear: false, uniforms: u, textures: [now, self.haze, view], buffers: [p, ambient])
+        let blurred = bloom.glow(cmd, hdr!, levels: 4)
+        cmd.draw(glassPass, into: lit!, uniforms: u, textures: [hdr!, blurred], buffers: [p, ambient])
+        lens.develop(f, lit!, Lens.Look(exposure: 1, bloom: 0.03, halation: 0.012, vignette: 0.3, aberration: 1.0, grain: 0.35))
 
         if let synth = f.sound { play(synth, f, w) }
+    }
+
+    private var blank: MTLTexture?
+    private func dummyTexture(_ gpu: GPU) -> MTLTexture {
+        if blank == nil { blank = gpu.texture(1, 1) }
+        return blank!
+    }
+
+    /// Fills the cloud shapes and the weather map once, on the first frame.
+    private func bakeNoise(_ f: Frame) {
+        guard let e = f.cmd.makeComputeCommandEncoder() else { return }
+        e.setComputePipelineState(noiseKernel)
+        e.setTexture(noise, index: 0)
+        e.dispatchThreads(MTLSize(width: 128, height: 128, depth: 128), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 4))
+        e.setComputePipelineState(weatherKernel)
+        e.setTexture(cloudWeather, index: 0)
+        e.dispatchThreads(MTLSize(width: 256, height: 256, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+        e.endEncoding()
     }
 
     // MARK: Sound

@@ -127,6 +127,7 @@ import IOKit.pwr_mgt
         usingSystem = false
         engine?.setScreensaver(false)
         Location.shared.holdPrompt = false
+        Task.detached(priority: .background) { Feed.trim() }
         if byUser {
             announce("Screensaver ended")
             // A sky scene wanted your location; now macOS can ask without fighting the screensaver for the keyboard.
@@ -196,9 +197,15 @@ import IOKit.pwr_mgt
         // Facts usually arrive a moment later, once live data has loaded.
         Task { [weak window] in
             try? await Task.sleep(for: .seconds(4))
-            guard let window, window.stage.kind?.id == kind.id, let facts = window.stage.scene?.facts else { return }
-            window.caption(kind.name + "  ·  " + facts, kind.clock)
+            guard let window, window.stage.kind?.id == kind.id, let scene = window.stage.scene,
+                  scene.facts != nil || scene.credit != nil else { return }
+            window.caption(Self.caption(kind, scene), kind.clock)
         }
+    }
+
+    /// The scene's name, its live facts, and whose imagery it shows.
+    private static func caption(_ kind: SceneKind, _ scene: Scene?) -> String {
+        ([kind.name] + [scene?.facts, scene?.credit].compactMap { $0 }).joined(separator: "  ·  ")
     }
 
     // MARK: Input
@@ -212,7 +219,7 @@ import IOKit.pwr_mgt
             guard let kind = window.stage.kind else { return }
             let facts = window.stage.scene?.facts
             announce(kind.name + ". " + (facts ?? kind.about))
-            window.caption(kind.name + (facts.map { "  ·  " + $0 } ?? ""), kind.clock)
+            window.caption(Self.caption(kind, window.stage.scene), kind.clock)
         case kVK_ANSI_M:
             Prefs.d.set(!Prefs.saverSound, forKey: Key.saverSound)
             if Prefs.saverSound { soundOn() } else { soundOff() }

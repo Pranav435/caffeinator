@@ -2,9 +2,9 @@ import AppKit
 import Metal
 import simd
 
-/// Every active satellite in Celestrak's catalogue, propagated on the GPU in real time and drawn with a fading tail
-/// along its orbit, coloured by orbit class. The camera follows the ISS low over the Earth, then pulls back to show
-/// the navigation shells and the geostationary ring.
+/// Every active satellite in Celestrak's catalogue, propagated on the GPU in real time over the real Earth and marked
+/// like a tracking display: a fine point per satellite with a short hairline tail along its orbit, tinted by orbit
+/// class and dimmed in the Earth's shadow. The camera follows the ISS, then pulls back past the geostationary ring.
 @MainActor final class Satellites: Scene {
     /// Matches `Sat` in the shader. a: period (minutes), semi-major axis (globe radii), eccentricity, inclination;
     /// b: node, perigee, mean anomaly at the reference time, kind; c: their rates a minute, then drag.
@@ -14,8 +14,9 @@ import simd
     private static let names: [Orbit.Kind: String] = [.starlink: "Starlink", .oneweb: "OneWeb", .low: "Other low orbit",
                                                        .medium: "Navigation and medium orbit", .geostationary: "Geostationary",
                                                        .eccentric: "Highly elliptical"]
-    static let colors: [Orbit.Kind: SIMD3<Float>] = [.starlink: [0.22, 0.75, 1.0], .oneweb: [0.48, 0.55, 1.0], .low: [0.86, 0.9, 1.0],
-                                                     .medium: [1.0, 0.72, 0.28], .geostationary: [1.0, 0.36, 0.56], .eccentric: [0.74, 0.46, 1.0]]
+    /// Linear colours by orbit class; the shader shows them in display space, matching the overlay's key.
+    static let colors: [Orbit.Kind: SIMD3<Float>] = [.starlink: [0.3, 0.7, 1.0], .oneweb: [0.45, 0.5, 1.0], .low: [0.8, 0.82, 0.86],
+                                                     .medium: [1.0, 0.66, 0.25], .geostationary: [1.0, 0.36, 0.42], .eccentric: [0.66, 0.42, 1.0]]
     private static let segments = 6
 
     private let globe: Globe
@@ -47,7 +48,7 @@ import simd
     private var issOver = false
 
     var scale: Float { 1 }
-    var ready: Bool { loaded && globe.lightsSettled }
+    var ready: Bool { loaded && globe.ready }
 
     var facts: String? {
         guard loaded else { return "Loading the satellite catalogue from Celestrak." }
@@ -56,7 +57,7 @@ import simd
         if let i = iss {
             let now = Date()
             let p = Orbit.subpoint(orbits[i].earthFixed(at: now))
-            s += "; the ISS is over \(globe.region(lat: p.lat, lon: p.lon)), \(EarthText.kilometres(p.height)) up"
+            s += "; the ISS is over \(Globe.region(lat: p.lat, lon: p.lon)), \(EarthText.kilometres(p.height)) up"
             let me = (Location.shared.latitude, Location.shared.longitude)
             if issOver {
                 s += ", passing over you right now"
@@ -72,10 +73,10 @@ import simd
         globe = try Globe.shared(gpu)
         canvas = try Globe.Canvas(gpu: gpu)
         let library = try gpu.library(Globe.metal + Self.source)
-        trails = try gpu.pipeline(library, "solid", vertex: "satTrail", blend: .add)
-        heads = try gpu.pipeline(library, "satHeadFill", vertex: "satHead", blend: .add)
-        track = try gpu.pipeline(library, "ribbonFill", vertex: "issTrack", blend: .add)
-        marks = try gpu.pipeline(library, "markFill", vertex: "mark", blend: .add)
+        trails = try gpu.pipeline(library, "solid", vertex: "satTrail", blend: .alpha)
+        heads = try gpu.pipeline(library, "satHeadFill", vertex: "satHead", blend: .alpha)
+        track = try gpu.pipeline(library, "trackFill", vertex: "issTrack", blend: .alpha)
+        marks = try gpu.pipeline(library, "markFill", vertex: "mark", blend: .alpha)
         sats = gpu.buffer(16)
         trackBuffer = gpu.buffer(16)
         start = Snapshot.variant.map { [0, 205, 165][$0 % 3] } ?? 0
@@ -131,37 +132,38 @@ import simd
         var dLon = (farLon - nearLon).truncatingRemainder(dividingBy: 360)
         if dLon > 180 { dLon -= 360 } else if dLon < -180 { dLon += 360 }
         let distance = exp(log(Float(3.4)) + (log(Float(19)) - log(Float(3.4))) * far)
-        let cam = Globe.Camera(lat: nearLat + (farLat - nearLat) * far, lon: nearLon + dLon * far, distance: distance,
-                               zoom: 2.3 + 0.3 * far, aspect: f.aspect, sun: Globe.sun(f.now))
+        let look = Earthquakes.towardDay((Double(nearLat + (farLat - nearLat) * far), Double(nearLon + dLon * far)), sun: Globe.sun(f.now), limit: 72)
+        let cam = Globe.Camera(lat: Float(look.lat), lon: Float(look.lon), distance: distance,
+                               zoom: 2.3 + 0.3 * far, aspect: f.aspect, date: f.now)
         camera = cam
 
         let light = canvas.light(for: f)
         let view = canvas.camera(cam)
         var style = Globe.Style()
-        style.coast = 0.8
-        style.graticule = 0.7
-        style.stars = 0.6
-        globe.draw(f.cmd, into: light, camera: view, style: style, time: f.time)
+        style.stars = 0.08
+        globe.refresh(f.now)
+        globe.draw(f.cmd, into: light, camera: view, style: style, date: f.now, time: f.time)
+        canvas.develop(f, Lens.Look(exposure: 0.92, bloom: 0.03, halation: 0.012, vignette: 0.28, aberration: 0.8, grain: 0.35))
 
+        // The tracking display goes over the developed picture.
         let minutes = Float(f.now.timeIntervalSince(reference) / 60)
         let gmst = Float(Astro.rad(Astro.gmst(f.now)))
         let sun = cam.sun
         if issNow != nil, f.now.timeIntervalSince(trackTime) > 1 { updateTrack(f.gpu, f.now) }
         if !orbits.isEmpty {
             let u = f.uniforms([minutes, gmst, f.size.y / 1000, far], SIMD4(sun, 0))
-            f.cmd.draw(trails, into: light, clear: false, uniforms: u, buffers: [view, sats],
-                       vertices: orbits.count * Self.segments * 2, primitive: .line)
-            f.cmd.draw(heads, into: light, clear: false, uniforms: u, buffers: [view, sats], vertices: orbits.count, primitive: .point)
             if trackPoints > 1 {
-                f.cmd.draw(track, into: light, clear: false, uniforms: u, buffers: [view, trackBuffer], vertices: (trackPoints - 1) * 6)
+                f.cmd.draw(track, into: f.target, clear: false, uniforms: u, buffers: [view, trackBuffer], vertices: (trackPoints - 1) * 6)
             }
+            f.cmd.draw(trails, into: f.target, clear: false, uniforms: u, buffers: [view, sats],
+                       vertices: orbits.count * Self.segments * 2, primitive: .line)
+            f.cmd.draw(heads, into: f.target, clear: false, uniforms: u, buffers: [view, sats], vertices: orbits.count, primitive: .point)
         }
-        // Markers: the ISS (white) and you (warm).
+        // Markers: the ISS (a reticle) and you (a crosshair).
         var markList: [SIMD4<Float>] = [SIMD4(me * 1.001, 0)]
         if let issNow { markList.append(SIMD4(SIMD3<Float>(issNow), 1)) }
-        f.cmd.draw(marks, into: light, clear: false, uniforms: f.uniforms([f.size.y / 1000, f.time, 0, 0]), buffers: [view, canvas.stream(0, markList)],
-                   vertices: 1, instances: markList.count, primitive: .point)
-        canvas.finish(f, globe: globe, bloom: 0.75)
+        f.cmd.draw(marks, into: f.target, clear: false, uniforms: f.uniforms([f.size.y / 1000, f.time, far, 0]),
+                   buffers: [view, canvas.stream(0, markList)], vertices: 1, instances: markList.count, primitive: .point)
 
         if let issNow { checkPass(SIMD3<Float>(issNow), me, f) }
         if let synth = f.sound { play(synth, f, me) }
@@ -268,7 +270,7 @@ import simd
                 let at = CGPoint(x: p.point.x + 26, y: p.point.y - 34)
                 ctx.earthLine(CGPoint(x: p.point.x + 5, y: p.point.y - 5), CGPoint(x: at.x - 3, y: at.y + 9), color: NSColor(white: 1, alpha: 0.4 * a))
                 ctx.text("ISS", at: at, size: 12.5, weight: .semibold, color: NSColor(white: 1, alpha: 0.9 * a), tracking: 1)
-                ctx.text("\(Int(info.height.rounded())) km · over \(self.globe.region(lat: info.lat, lon: info.lon))",
+                ctx.text("\(Int(info.height.rounded())) km · over \(Globe.region(lat: info.lat, lon: info.lon))",
                          at: CGPoint(x: at.x, y: at.y + 16), size: 10.5, color: NSColor(white: 1, alpha: 0.5 * a))
             }
             // You.
@@ -305,13 +307,13 @@ import simd
     private static let source = """
     struct Sat { float4 a; float4 b; float4 c; };
 
-    constant float3 kindColors[6] = { float3(0.22, 0.75, 1.0), float3(0.48, 0.55, 1.0), float3(0.86, 0.9, 1.0),
-                                      float3(1.0, 0.72, 0.28), float3(1.0, 0.36, 0.56), float3(0.74, 0.46, 1.0) };
-    constant float kindLevels[6] = { 0.2, 0.26, 0.17, 1.2, 1.0, 0.9 };
+    constant float3 kindColors[6] = { float3(0.3, 0.7, 1.0), float3(0.45, 0.5, 1.0), float3(0.8, 0.82, 0.86),
+                                      float3(1.0, 0.66, 0.25), float3(1.0, 0.36, 0.42), float3(0.66, 0.42, 1.0) };
+    constant float kindLevels[6] = { 0.42, 0.5, 0.42, 0.95, 0.95, 0.9 };
 
-    // Low orbiters dim as the camera pulls back and they crowd together; the high ones only show once it's outside them.
+    // Low orbiters thin out as the camera pulls back and they crowd together; the high ones only show once it's outside them.
     inline float kindLevel(int kind, float far) {
-        return kindLevels[kind] * (kind < 3 ? 1 - 0.55 * far : smoothstep(0.3, 0.65, far));
+        return kindLevels[kind] * (kind < 3 ? 1 - 0.5 * far : smoothstep(0.3, 0.65, far));
     }
 
     // Earth-fixed position, in globe radii, t minutes after the reference time; gmst in radians.
@@ -333,12 +335,12 @@ import simd
     inline float sunlit(float3 p, float3 sun) {
         float along = dot(p, sun);
         if (along > 0) return 1;
-        return mix(0.22, 1.0, smoothstep(0.98, 1.03, length(p - along * sun)));
+        return mix(0.3, 1.0, smoothstep(0.98, 1.03, length(p - along * sun)));
     }
 
     // Shells pile up where the view grazes them, at the limb; even that out so the face of the swarm reads too.
     inline float graze(float3 p, constant GlobeCamera &c) {
-        return mix(0.3, 1.0, sqrt(abs(dot(normalize(p), normalize(c.eye - p)))));
+        return mix(0.6, 1.0, sqrt(abs(dot(normalize(p), normalize(c.eye - p)))));
     }
 
     // Fade satellites that come too close to the camera.
@@ -361,13 +363,12 @@ import simd
         P o;
         o.pos = globeClip(p, c);
         o.size = 1;
-        float fade = pow(1 - back, 1.8);
-        float b = kindLevel(kind, u.a.w) * 0.6 * fade * globeShown(p, c) * sunlit(p, u.b.xyz) * nearFade(p, c) * graze(p, c);
-        o.color = float4(kindColors[kind] * b, 0);
+        float a = kindLevel(kind, u.a.w) * 0.32 * pow(1 - back, 1.6) * globeShown(p, c) * sunlit(p, u.b.xyz) * nearFade(p, c) * graze(p, c);
+        o.color = float4(toSRGB(kindColors[kind]), 1) * a;
         return o;
     }
 
-    struct Head { float4 pos [[position]]; float size [[point_size]]; float3 color; };
+    struct Head { float4 pos [[position]]; float size [[point_size]]; float4 color; };
 
     vertex Head satHead(uint i [[vertex_id]], constant U &u [[buffer(0)]], constant GlobeCamera &c [[buffer(1)]],
                         const device Sat *sats [[buffer(2)]]) {
@@ -377,51 +378,74 @@ import simd
         Head o;
         o.pos = globeClip(p, c);
         float shown = globeShown(p, c) * nearFade(p, c);
-        o.size = (kind == 0 ? 3.2 : 4.2) * u.a.z;
-        o.color = kindColors[kind] * kindLevel(kind, u.a.w) * 1.5 * shown * sunlit(p, u.b.xyz) * graze(p, c);
+        o.size = (kind == 0 ? 2.6 : 3.2) * u.a.z;
+        float a = kindLevel(kind, u.a.w) * shown * sunlit(p, u.b.xyz) * graze(p, c);
+        o.color = float4(toSRGB(kindColors[kind]), 1) * saturate(a);
         if (shown <= 0) o.pos = float4(0, 0, -1, 1);
         return o;
     }
 
+    // A crisp point, a pixel and a half across.
     fragment float4 satHeadFill(Head in [[stage_in]], float2 pc [[point_coord]]) {
         float d = length(pc - 0.5) * 2;
-        return float4(in.color * (smoothstep(0.6, 0.1, d) + exp(-d * d * 5) * 0.3), 0);
+        float px = max(fwidth(d), 1e-3);
+        return in.color * (1 - smoothstep(0.55 - px, 0.55 + px, d));
     }
 
-    // The ISS ground track as a ribbon: the last 45 minutes bright, the next 50 fainter.
+    // The ISS ground track as a hairline: the last 45 minutes solid, the next 50 dashed.
     vertex Ribbon issTrack(uint vid [[vertex_id]], constant U &u [[buffer(0)]], constant GlobeCamera &c [[buffer(1)]],
                            const device float4 *pts [[buffer(2)]]) {
         uint seg = vid / 6;
         float4 a = pts[seg], b = pts[seg + 1];
-        float age = (vid % 6 == 2 || vid % 6 == 3 || vid % 6 == 5) ? b.w : a.w;
-        float3 q = (vid % 6 == 2 || vid % 6 == 3 || vid % 6 == 5) ? b.xyz : a.xyz;
-        float level = age < 0 ? 0.35 * pow(1 + age / 46, 1.5) : 0.16 * (1 - age / 52);
-        float4 color = float4(float3(0.75, 0.9, 1.0) * level * globeFacing(q, c) * (1 - u.a.w * 0.8), 0);
-        return ribbon(vid % 6, globeClip(a.xyz, c), globeClip(b.xyz, c), 1.6 * u.a.z, color, u.res);
+        bool atB = vid % 6 == 2 || vid % 6 == 3 || vid % 6 == 5;
+        float age = atB ? b.w : a.w;
+        float3 q = atB ? b.xyz : a.xyz;
+        float level = age < 0 ? 0.6 * pow(1 + age / 46, 1.2) : 0.45 * (1 - age / 52);
+        float alpha = level * globeFacing(q, c) * (1 - u.a.w * 0.8);
+        Ribbon o = ribbon(vid % 6, globeClip(a.xyz, c), globeClip(b.xyz, c), 1.0 * u.a.z, float4(0.92, 0.94, 0.96, 1) * alpha, u.res);
+        o.along = age;
+        return o;
     }
 
-    struct Mark { float4 pos [[position]]; float size [[point_size]]; float3 color; float kind; };
+    fragment float4 trackFill(Ribbon in [[stage_in]]) {
+        float dash = in.along < 0 ? 1 : step(0.45, fract(in.along * 0.5));
+        return in.color * saturate(in.half_width + 0.5 - abs(in.across)) * dash;
+    }
 
-    // u.a: pixel scale, time
+    struct Mark { float4 pos [[position]]; float size [[point_size]]; float4 color; float kind; };
+
+    // u.a: pixel scale, time, how far out the camera is
     vertex Mark mark(uint i [[instance_id]], constant U &u [[buffer(0)]], constant GlobeCamera &c [[buffer(1)]],
                      const device float4 *marks [[buffer(2)]]) {
         float4 m = marks[i];
         Mark o;
         o.pos = globeClip(m.xyz, c);
         o.kind = m.w;
-        float shown = m.w > 0.5 ? globeShown(m.xyz, c) : globeFacing(m.xyz, c);
-        o.size = (m.w > 0.5 ? 26 : 18) * u.a.x;
-        o.color = (m.w > 0.5 ? float3(1.0, 0.97, 0.92) * 1.6 : float3(1.0, 0.62, 0.3) * 0.9) * shown;
+        float shown = m.w > 0.5 ? globeShown(m.xyz, c) : globeFacing(m.xyz, c) * (1 - u.a.z * 0.6);
+        o.size = (m.w > 0.5 ? 30 : 22) * u.a.x * (1 - 0.45 * u.a.z);
+        o.color = (m.w > 0.5 ? float4(0.95, 0.96, 0.97, 1) * 0.9 : float4(1.0, 0.78, 0.55, 1) * 0.85) * shown;
         if (shown <= 0) o.pos = float4(0, 0, -1, 1);
         return o;
     }
 
+    // The ISS gets four corner brackets, like a tracking reticle; you get a small crosshair.
     fragment float4 markFill(Mark in [[stage_in]], float2 pc [[point_coord]]) {
-        float d = length(pc - 0.5) * 2;
-        float fw = fwidth(d);
-        float ring = saturate(1 - abs(d - 0.75) / max(fw * 1.2, 1e-3));
-        float core = smoothstep(in.kind > 0.5 ? 0.22 : 0.18, 0.05, d);
-        return float4(in.color * (core + ring * 0.45), 0);
+        float2 p = (pc - 0.5) * 2;
+        float px = max(fwidth(p.x), 1e-3) * 1.1;
+        float2 a = abs(p);
+        float ink;
+        if (in.kind > 0.5) {
+            float frame = max(1 - smoothstep(0.0, px, abs(a.x - 0.82)) , 0.0) * step(a.y, 0.84) * step(0.45, a.y)
+                        + max(1 - smoothstep(0.0, px, abs(a.y - 0.82)), 0.0) * step(a.x, 0.84) * step(0.45, a.x);
+            float dot_ = 1 - smoothstep(0.1, 0.1 + px, length(p));
+            ink = saturate(frame + dot_);
+        } else {
+            float ring = 1 - smoothstep(0.0, px, abs(length(p) - 0.42));
+            float cross_ = (1 - smoothstep(0.0, px, a.x)) * step(0.55, a.y) * step(a.y, 0.95)
+                         + (1 - smoothstep(0.0, px, a.y)) * step(0.55, a.x) * step(a.x, 0.95);
+            ink = saturate(ring + cross_);
+        }
+        return in.color * ink;
     }
     """
 }
